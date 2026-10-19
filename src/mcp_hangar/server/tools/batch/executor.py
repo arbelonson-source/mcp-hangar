@@ -1398,9 +1398,9 @@ class BatchExecutor:
         )
         started = time.perf_counter()
         result = self._mutator_pipeline.execute(ctx)
-        # Only a pipeline with mutators is observed: the default one does nothing,
-        # and an event on every call saying so would be noise (#1298).
-        if self._mutator_pipeline.has_mutators:
+        # Only a pipeline with a mutator for this method is observed: otherwise
+        # none ran, and an event on every call saying so would be noise (#1298).
+        if self._mutator_pipeline.has_mutators_for(method):
             record_mutation(direction, result.changed, round((time.perf_counter() - started) * 1000, 3))
         return result.payload
 
