@@ -31,10 +31,11 @@ import pytest
 pytestmark = pytest.mark.otel_sdk
 
 HARNESS = Path(__file__).with_name("_audit_log_harness.py")
-MODES = ("yaml", "env", "none", "tracing_off", "auth", "bound")
+MODES = ("yaml", "env", "none", "tracing_off", "auth", "bound", "front_door")
 
 # As `_audit_log_harness.py` mints and declares them.
-AUTH_PRINCIPAL, AUTH_TENANT = "user:audit-harness", "tenant-audit"
+AUTH_PRINCIPAL, AUTH_TENANT, AUTH_ROLE = "user:audit-harness", "tenant-audit", "developer"
+VIEWER_PRINCIPAL = "user:audit-viewer"
 BOUND_AGENT, BOUND_SESSION, BOUND_TENANT = "agent-audit", "session-audit", "tenant-bound"
 
 # The `auth` run's resource environment: OTEL_RESOURCE_ATTRIBUTES must beat
@@ -173,10 +174,10 @@ def test_an_authenticated_call_records_its_caller_and_tenant(runs):
     # An API key authenticates a service-account principal.
     assert attributes["mcp.caller.type"] == "service"
     assert attributes["mcp.caller.tenant_id"] == AUTH_TENANT
-    # Neither is invented: the served HTTP path's identity carries no session,
-    # and no identity carries roles.
+    # Not invented: the served HTTP path's identity carries no session.
     assert "mcp.session.id" not in attributes
-    assert "mcp.caller.roles" not in attributes
+    # The role the authorization decision matched, from that decision (#1347).
+    assert attributes["mcp.caller.roles"] == AUTH_ROLE
 
 
 def test_a_declared_session_and_agent_reach_the_record(runs):
@@ -190,6 +191,8 @@ def test_a_declared_session_and_agent_reach_the_record(runs):
     assert attributes["mcp.caller.type"] == "anonymous"
     assert attributes["mcp.caller.tenant_id"] == BOUND_TENANT
     assert "mcp.user.id" not in attributes
+    # Auth is off: an identity, and no decision that authorized anything (#1347).
+    assert "mcp.caller.roles" not in attributes
 
 
 def test_a_failed_call_records_its_duration(runs):
@@ -202,6 +205,96 @@ def test_a_failed_call_records_its_duration(runs):
     assert failures and all(a["mcp.tool.status"] == "error" for a in failures), failures
     assert all(a["mcp.tool.duration_ms"] > 0.0 for a in failures), failures
     assert all(a["mcp.caller.id"] == AUTH_PRINCIPAL for a in failures), failures
+    assert all(a["mcp.caller.roles"] == AUTH_ROLE for a in failures), failures
+
+
+def test_a_refused_call_records_one_denial_with_its_gate(runs):
+    """A gate refusal reaches audit once, as `denied`, with bounded fields and the caller (#1582)."""
+    run = runs["auth"]
+    assert run["calls"]["refused"]["batch"]["success"] is False, run["calls"]
+
+    attributes = _record_for(run, "refused")["attributes"]
+
+    assert (attributes["mcp.tool.status"], attributes["gen_ai.tool.name"]) == ("denied", "multiply")
+    assert (attributes["hangar.gate.name"], attributes["hangar.gate.reason"]) == (
+        "tool_access",
+        "tool_not_in_access_policy",
+    )
+    assert attributes["mcp.caller.id"] == AUTH_PRINCIPAL
+    assert attributes["mcp.caller.tenant_id"] == AUTH_TENANT
+    assert "mcp.error.type" not in attributes
+    # Authorization admitted it before the gate refused it: the record says by what role (#1347).
+    assert attributes["mcp.caller.roles"] == AUTH_ROLE
+
+
+def test_a_call_authorization_refused_names_no_role(runs):
+    """A `tool:invoke` denial had no authorizing role, so its record carries none (#1347)."""
+    run = runs["auth"]
+    assert run["calls"]["unauthorized"]["batch"]["success"] is False, run["calls"]
+
+    attributes = _record_for(run, "unauthorized")["attributes"]
+
+    assert (attributes["hangar.gate.name"], attributes["hangar.gate.reason"]) == (
+        "authorization",
+        "tool_invoke_denied",
+    )
+    assert attributes["mcp.caller.id"] == VIEWER_PRINCIPAL
+    assert "mcp.caller.roles" not in attributes
+
+
+def test_a_front_door_viewer_is_refused_and_a_developer_served(runs):
+    """The front door's flat call checks `tool:invoke` as `hangar_call` does (#1622).
+
+    Over streamable HTTP, behind the auth the served app mounts: the `viewer`
+    key is refused as a tool error before the upstream is called, with one
+    `denied` record naming the authorization gate and no role; the `developer`
+    key is served, and its record names the role that admitted it.
+    """
+    run = runs["front_door"]
+    served, refused = run["calls"]["flat_served"]["result"], run["calls"]["flat_unauthorized"]["result"]
+
+    # The stub upstream answers with a bare value rather than a tool result, so
+    # the front door reports that shape; what matters is that the call ran, and
+    # the `success` record below is written only by a call that did.
+    assert "tool:invoke" not in json.dumps(served), served
+    assert refused.get("isError") is True, refused
+    assert refused["content"][0]["text"] == "Not authorized to invoke tool 'add': tool:invoke permission required"
+
+    allowed = _record_for(run, "flat_served")["attributes"]
+    assert (allowed["mcp.tool.status"], allowed["gen_ai.tool.name"]) == ("success", "add")
+    assert (allowed["mcp.caller.id"], allowed["mcp.caller.roles"]) == (AUTH_PRINCIPAL, AUTH_ROLE)
+
+    denied = _record_for(run, "flat_unauthorized")["attributes"]
+    assert (denied["mcp.tool.status"], denied["gen_ai.tool.name"]) == ("denied", "add")
+    assert (denied["hangar.gate.name"], denied["hangar.gate.reason"]) == ("authorization", "tool_invoke_denied")
+    assert denied["mcp.caller.id"] == VIEWER_PRINCIPAL
+    assert "mcp.caller.roles" not in denied
+    # One record per call: the refusal adds nothing, and the refused call ran nothing.
+    assert [r["attributes"]["mcp.tool.status"] for r in _tool_records(run)] == ["success", "denied"]
+
+
+@pytest.mark.parametrize(("mode", "served"), [("auth", "sampled"), ("front_door", "flat_served")])
+def test_caller_roles_reach_no_span(runs, mode, served):
+    """The roles are on the audit record only; the #1276 contract keeps them off spans (#1580, #1628).
+
+    Both call paths, `hangar_call` and the front door's flat call, over the
+    real SDK exporter. The served call's record names the role, so a role was
+    bound on the call whose spans carry none.
+    """
+    run = runs[mode]
+    keys = run["span_attribute_keys"]
+
+    assert _record_for(run, served)["attributes"]["mcp.caller.roles"] == AUTH_ROLE
+    assert "gen_ai.tool.name" in keys, "spans were recorded, so the absence below is a result"
+    assert "mcp.caller.roles" not in keys
+
+
+def test_an_allowed_call_beside_a_refused_one_still_has_one_record(runs):
+    """`_record_for` asserts exactly one; the refusal adds none to the calls that ran."""
+    run = runs["auth"]
+
+    assert _record_for(run, "sampled")["attributes"]["mcp.tool.status"] == "success"
+    assert [r["attributes"]["mcp.tool.status"] for r in _tool_records(run)].count("denied") == 2  # gate, authz
 
 
 @pytest.mark.parametrize("mode", ["auth", "bound"], ids=["resource-env", "defaults"])

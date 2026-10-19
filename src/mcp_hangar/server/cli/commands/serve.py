@@ -11,6 +11,12 @@ from typing import Annotated
 
 import typer
 
+from ..config_path import DEFAULT_RULE_HELP, MissingConfigFileError, require_config_file, resolve_config_path
+from ..errors import CLIError
+
+#: What `MCP_MODE` may say to serve HTTP: the documented `http`, and the bool spellings the option took.
+_HTTP_MODE_VALUES = frozenset({"http", "1", "true", "yes", "on"})
+
 
 def serve_command(
     ctx: typer.Context,
@@ -19,16 +25,14 @@ def serve_command(
         typer.Option(
             "--config",
             "-c",
-            help="Path to config.yaml file",
-            envvar="MCP_CONFIG",
+            help="Path to config.yaml. " + DEFAULT_RULE_HELP,
         ),
     ] = None,
     http: Annotated[
         bool,
         typer.Option(
             "--http",
-            help="Run in HTTP mode instead of stdio",
-            envvar="MCP_MODE",
+            help="Run in HTTP mode instead of stdio (MCP_MODE=http does the same)",
             is_flag=True,
         ),
     ] = False,
@@ -36,10 +40,10 @@ def serve_command(
         str,
         typer.Option(
             "--host",
-            help="HTTP server host",
+            help="HTTP server host (default: loopback; a non-loopback host needs auth)",
             envvar="MCP_HTTP_HOST",
         ),
-    ] = "0.0.0.0",
+    ] = "127.0.0.1",
     port: Annotated[
         int,
         typer.Option(
@@ -96,29 +100,36 @@ def serve_command(
     # Get global options
     global_opts = ctx.obj
 
-    # A --config passed to `serve` overrides the top-level option; when it is
-    # absent, fall back to the value resolved by the main CLI callback. This
-    # lets both `mcp-hangar --config X serve` and `mcp-hangar serve --config X`
-    # work.
-    resolved_config = config if config is not None else getattr(global_opts, "config", None)
+    # `serve --config X` before `mcp-hangar --config X`, then the shared
+    # default. The result is always a path: bootstrap watches the file it is
+    # given, and with none every reload failed (#1657).
+    resolved = resolve_config_path(config, getattr(global_opts, "config", None))
+    # Before anything starts: a missing file is fatal, never a demo config (#1650).
+    try:
+        resolved_config = require_config_file(resolved)
+    except MissingConfigFileError as e:
+        raise CLIError(message=e.message, exit_code=1) from e
 
     # Build CLIConfig for backward compatibility with existing server code
     from ..cli_compat import CLIConfig
 
     # Resolve http mode from environment if flag not set
     http_mode = http
-    if not http_mode and os.getenv("MCP_MODE", "").lower() == "http":
+    # Read here, not bound to the flag: a bool option refuses `MCP_MODE=http` (#1660).
+    # The bool spellings the flag used to take stay accepted.
+    if not http_mode and os.getenv("MCP_MODE", "").strip().lower() in _HTTP_MODE_VALUES:
         http_mode = True
 
     cli_config = CLIConfig(
         http_mode=http_mode,
         http_host=host,
         http_port=port,
-        config_path=str(resolved_config) if resolved_config else None,
+        config_path=str(resolved_config),
         log_file=log_file,
         log_level=log_level.upper(),
         json_logs=json_logs,
         unsafe_no_auth=unsafe_no_auth,
+        config_source=resolved.source,
     )
 
     # Import and run the server

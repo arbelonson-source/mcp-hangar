@@ -11,7 +11,6 @@ Provides parallel execution of batch invocations with:
 
 import asyncio
 import contextvars
-import json
 import threading
 import time
 from collections.abc import Coroutine
@@ -27,13 +26,14 @@ from ....application.read_models.tool_projection import get_tool_projection_regi
 from ....application.services.mutator_pipeline import MutatorPipeline
 from ....application.services.validator_pipeline import ValidatorPipeline
 from ....application.tasks.tool_pin_context import CurrentToolPin, get_current_tool_pin, set_current_tool_pin
-from ....context import bind_routing_headers, get_identity_context, release_routing_headers
+from ....context import bind_routing_headers, get_identity_context, identity_context_var, release_routing_headers
 from ....domain.contracts.mutator import MutationContext
 from ....domain.contracts.validator import ValidationContext
 from ....domain.events import (
     BatchCallCompleted,
     BatchInvocationCompleted,
     BatchInvocationRequested,
+    ToolCallRefused,
     ToolWithdrawnRejected,
 )
 from ....domain.exceptions import CannotStartMcpServerError
@@ -42,11 +42,21 @@ from ....domain.model.mcp_server import (
     START_REFUSED_IN_BACKOFF,
     START_REFUSED_NOT_REVIVED_BY_CALLS,
 )
+from ....domain.model.mcp_server_group import RouteReason
 from ....domain.services import get_tool_access_resolver
 from ....domain.services.digest_validator import DigestValidator
 from ....domain.services.governance_overlays import read_as_one_set
 from ....domain.value_objects import DigestEnforcement, DigestPolicy, DigestUnknownPolicy
+from ....domain.value_objects.identity import IdentityContext
 from ....domain.value_objects.truncation import ContinuationOwner
+from ....errors import bounded_error_type
+from ....infrastructure.observability.l7_verdicts import (
+    L7Decision,
+    L7VerdictHolder,
+    bounded_l7_decision,
+    holding_l7_verdict,
+    record_l7_decision,
+)
 from ....infrastructure.observability.startup_spans import StartupSpanAdapter
 from ....infrastructure.single_flight import SingleFlight
 from ....logging_config import get_logger
@@ -57,7 +67,6 @@ from ....metrics import (
     BATCH_CONCURRENCY_GAUGE,
     BATCH_DURATION_SECONDS,
     BATCH_SIZE_HISTOGRAM,
-    BATCH_TRUNCATIONS_TOTAL,
     TENANT_QUOTA_REFUSALS_TOTAL,
     TOOL_ACCESS_DENIED_TOTAL,
 )
@@ -66,16 +75,18 @@ from ....negotiation import (
     reset_current_protocol_negotiation,
     set_current_protocol_negotiation,
 )
-from ....observability.conventions import MCP, Caller, Gate, GenAI, McpServer, Retry, Shaping
+from ....observability.conventions import MCP, Caller, Gate, GenAI, McpServer, Retry, Route, Shaping
 from ....observability.tracing import (
+    caller_ids_on_spans,
+    current_traceparent,
     extract_trace_context,
     get_tracer,
     record_call_outcome,
     record_gate_decision,
     record_handled_failure,
     record_mutation,
-    record_result_drop,
     record_retry_attempt,
+    record_route,
     settle_failed_call,
 )
 from ....retry import RetryPolicy, RetryResult, configured_retry_policy, retry_sync
@@ -83,7 +94,7 @@ from ...context import get_context
 from ...state import GROUPS
 from .concurrency import ConcurrencyManager, get_concurrency_manager
 from .member_health import MemberOutcome, member_outcome
-from .models import MAX_RESPONSE_SIZE_BYTES, BatchResult, CallResult, CallSpec, RelayCapture, RetryMetadata
+from .models import BatchResult, CallResult, CallSpec, RelayCapture, RetryMetadata
 from .relay_seam import upstream_task
 from .tenant_admission import CONCURRENCY, NO_BUDGET, RATE, Grant, Refusal, Reservation, get_tenant_admission
 
@@ -134,6 +145,10 @@ _GATE_ERRORS = frozenset({"McpServerStartError", "ApprovalGateError", "ApprovalR
 #: this set to the exceptions carrying that marker, so a new one cannot be
 #: recorded as a failure here while the tracer treats it as a refusal.
 _REFUSED_AT_DISPATCH = frozenset({"EgressPolicyDeniedError", "EgressPolicyApprovalRequiredError", "RateLimitExceeded"})
+
+#: The dispatch refusals the aggregate's L7 policy raises (#1295). Their log line
+#: carries the verdict's bounded fields, not the policy's joined reasons.
+_L7_REFUSALS = frozenset({"EgressPolicyDeniedError", "EgressPolicyApprovalRequiredError"})
 
 
 def _inbound_trace_meta(ctx: Any) -> dict[str, str]:
@@ -202,11 +217,17 @@ def _identity_span_attributes() -> dict[str, str]:
     ``mcp.caller.tenant_id`` selects the calls that actually had a tenant
     instead of every call ever made.
 
-    Deliberately not ``set_governance_attributes``: that helper also asserts
-    ``gen_ai.operation.name=execute_tool`` and ``mcp.method.name=tools/call``,
-    which name the upstream call. ADR-029 keeps those on the one CLIENT span
-    ``execute_tool <tool>``; repeating them here would invite a GenAI-aware
-    backend to count one invocation twice.
+    Deliberately not ``gen_ai.operation.name=execute_tool`` or
+    ``mcp.method.name=tools/call``: those name the upstream call. ADR-029 keeps
+    them on the one CLIENT span ``execute_tool <tool>``; repeating them here
+    would invite a GenAI-aware backend to count one invocation twice. The
+    caller's roles are never set: they go on the audit record only (#1347).
+
+    The caller's own identifiers -- ``mcp.caller.id``, ``mcp.user.id``,
+    ``mcp.agent.id`` and ``mcp.session.id`` -- are set only when the operator
+    opted in with ``observability.tracing.caller_ids`` (#1580): the #1276
+    contract keeps them off spans by default, as ADR-029 s10 records. Type,
+    tenant and correlation id are not personal identifiers and always go.
     """
     identity = get_identity_context()
     if identity is None:
@@ -214,14 +235,31 @@ def _identity_span_attributes() -> dict[str, str]:
     caller = identity.caller
     candidates = {
         Caller.TYPE: caller.principal_type,
-        Caller.ID: caller.user_id or caller.agent_id,
         Caller.TENANT: caller.tenant_id,
-        MCP.USER_ID: caller.user_id,
-        MCP.AGENT_ID: caller.agent_id,
-        MCP.SESSION_ID: caller.session_id,
         MCP.CORRELATION_ID: identity.correlation_id,
     }
+    if caller_ids_on_spans():
+        candidates |= {
+            Caller.ID: caller.user_id or caller.agent_id,
+            MCP.USER_ID: caller.user_id,
+            MCP.AGENT_ID: caller.agent_id,
+            MCP.SESSION_ID: caller.session_id,
+        }
     return {key: value for key, value in candidates.items() if value}
+
+
+def _bind_caller_roles(call: CallSpec) -> contextvars.Token[IdentityContext | None] | None:
+    """Bind a copy of the caller's identity naming what authorized *call* (#1347), or nothing.
+
+    The copy is this call's: the batch's identity is not changed, so one call's
+    role never reaches another's record. Everything the call publishes -- its
+    invocation events, a gate's ``ToolCallRefused`` -- reads it from here.
+    Nothing reads it onto a span (#1276, #1580).
+    """
+    identity = get_identity_context()
+    if not call.caller_roles or identity is None:
+        return None
+    return identity_context_var.set(identity.with_roles(call.caller_roles))
 
 
 def _inbound_meta_dict(ctx: Any) -> dict[str, Any] | None:
@@ -430,6 +468,12 @@ def _approval_policy(
         if not scoped.is_unrestricted() and scoped.requires_approval(tool):
             return scoped
     return None
+
+
+def _upstream_of(server: Any) -> str | None:
+    """The identity of the upstream *server* fronts, or None when it cannot say (#1802)."""
+    identity = getattr(server, "upstream_identity", None)
+    return identity() if callable(identity) else None
 
 
 @dataclass(frozen=True)
@@ -680,6 +724,11 @@ class _CallPipeline:
     is_group: bool = False
     group_obj: Any = None
     target_server_id: str = ""
+    #: The backend the route was recorded with, or None before one was chosen
+    #: (and when none could be): what a refusal's audit record names as
+    #: `hangar.route.backend` (#1594). `target_server_id` is preset to the
+    #: logical target, so it cannot tell a group with no member from a server.
+    route_backend: str | None = None
     #: Decided when a gate first asks: see `governance`.
     _governance: _Governance | None = None
     _projection: Any = _UNRESOLVED
@@ -694,6 +743,9 @@ class _CallPipeline:
     #: that returns None without a note let the call through (`allow`); one
     #: that does not apply, or defers, says so here, because None alone cannot.
     gate_note: tuple[str, str | None, str | None] | None = None
+    #: Set by _gate_approval when a human granted the call: the approval to move
+    #: to cancelled if the batch is cancelled before the call is dispatched (#1730).
+    granted_approval_id: str | None = None
 
     def note(self, outcome: str, reason: str | None = None, revision: str | None = None) -> None:
         """Say what the running gate decided, beyond the CallResult or None it returns."""
@@ -822,7 +874,10 @@ def _retry_policy_for(call: Any) -> RetryPolicy | None:
     Two rules decide the result:
 
     * **Config is the ceiling.** An explicit `max_attempts` from the caller can
-      lower the attempt count and never raise it. The operator configures how
+      lower the attempt count and never raise it. An explicit 1 is exactly one
+      attempt, whatever is configured: a caller whose tool is not idempotent has
+      to be able to say so (#1678). Left unsaid (`None`), the configured count
+      applies. The operator configures how
       hard this gateway is willing to lean on an upstream; a caller asking for
       more attempts than that is asking to be someone else's load problem.
     * **No config means no change.** `RetryPolicy()` is three attempts, so
@@ -831,18 +886,20 @@ def _retry_policy_for(call: Any) -> RetryPolicy | None:
       `None` rather than a policy nobody asked for.
     """
     configured = configured_retry_policy(call.mcp_server)
-    caller_attempts = getattr(call, "max_retries", 1) or 1
+    caller_attempts: int | None = getattr(call, "max_retries", None)
 
     if configured is None:
-        return RetryPolicy(max_attempts=caller_attempts) if caller_attempts > 1 else None
+        if caller_attempts is None or caller_attempts <= 1:
+            return None
+        return RetryPolicy(max_attempts=caller_attempts)
 
-    attempts = min(configured.max_attempts, caller_attempts) if caller_attempts > 1 else configured.max_attempts
+    attempts = configured.max_attempts if caller_attempts is None else min(configured.max_attempts, caller_attempts)
     if attempts <= 1:
         return None
     return replace(configured, max_attempts=attempts)
 
 
-def _log_call_failure(call: Any, error: Any, error_type: str, elapsed_ms: float) -> None:
+def _log_call_failure(call: Any, error: Any, error_type: str, elapsed_ms: float, l7: L7Decision | None = None) -> None:
     """Log a failed call, loudly when the failure was a deliberate refusal.
 
     A policy refusal and an upstream blowing up are not the same class of event
@@ -855,11 +912,21 @@ def _log_call_failure(call: Any, error: Any, error_type: str, elapsed_ms: float)
     is a warning and it says why. Everything else keeps the debug level: an
     upstream failure is already reported to the caller in the CallResult, and
     raising it here would make a batch of failing calls a log flood.
+
+    An L7 refusal logs the verdict's bounded fields from *l7*, the reading the
+    call's span got, and not `reason`: that was the policy's reasons joined into
+    free text (#1295, #1276 R7). One refused because its arguments could not be
+    inspected is `batch_call_failed`, as its span's outcome is `error`, still at
+    warning: the call was refused.
     """
     details = getattr(error, "details", None)
-    reason = details.get("reason") if isinstance(details, dict) else None
-    refused = error_type in _REFUSED_AT_DISPATCH
-    log = logger.warning if refused else logger.debug
+    if error_type in _L7_REFUSALS:
+        fields = l7.log_fields() if l7 is not None else {"l7_verdict": None}
+    else:
+        fields = {"reason": details.get("reason") if isinstance(details, dict) else None}
+    evaluator_failed = l7 is not None and l7.evaluator_failed
+    refused = error_type in _REFUSED_AT_DISPATCH and not evaluator_failed
+    log = logger.warning if refused or evaluator_failed else logger.debug
     log(
         "batch_call_refused" if refused else "batch_call_failed",
         call_id=call.call_id,
@@ -867,10 +934,26 @@ def _log_call_failure(call: Any, error: Any, error_type: str, elapsed_ms: float)
         tool=call.tool,
         error=str(error),
         error_type=error_type,
-        reason=reason,
         policy_id=getattr(error, "policy_id", None),
         elapsed_ms=round(elapsed_ms, 2),
+        **fields,
     )
+
+
+def _publish_l7_refusal(
+    ctx: Any, call: CallSpec, error_type: str, elapsed_ms: float, l7: L7Decision | None, route_backend: str
+) -> None:
+    """Publish `ToolCallRefused` for an L7 refusal, the calls `_log_call_failure` logs as `batch_call_refused`.
+
+    One refused because its arguments could not be inspected is not: its
+    evaluator broke (ADR-029 s5), as a gate that errs is no refusal either.
+    The verdict is the dispatched server's, so the record names it as the
+    route's backend (#1594).
+    """
+    if error_type in _L7_REFUSALS and not (l7 is not None and l7.evaluator_failed):
+        publish_call_refused(
+            ctx.event_bus, call, elapsed_ms, get_identity_context(), l7=l7, route_backend=route_backend
+        )
 
 
 class BatchExecutor:
@@ -944,6 +1027,8 @@ class BatchExecutor:
         # continuation tools read the caller the same way.
         owner = ContinuationOwner.of(get_identity_context())
         budgeted = [r for r in results if r.index not in whole]
+        if not budgeted:  # every call takes its result whole: nothing to budget
+            return results
         # Its own span: truncation can write the cut results to the continuation
         # cache. Counts and a flag only, never a result or a continuation id (#1298).
         with get_tracer(__name__).start_as_current_span("batch.truncate") as span:
@@ -995,6 +1080,7 @@ class BatchExecutor:
         tenant_id: str | None = None,
         scopes: list[tuple[str, str | None, str | None]] | None = None,
         governance: _Governance | None = None,
+        abandoned: threading.Event | None = None,
     ) -> CallResult | None:
         """Check if the tool requires approval and block until resolved.
 
@@ -1013,6 +1099,8 @@ class BatchExecutor:
                 is the one this gate applies, read with the rest of the call's
                 governance as one set (#1431). Without it, the approval lists
                 of *scopes* are read here, as one set.
+            abandoned: The batch's cancel event. An approval that arrives
+                after it is set is refused and recorded ``cancelled`` (#1702).
         """
         # Cleared per call: worker threads are reused across calls, so a stale
         # id from the previous call in this thread must never be revalidated
@@ -1097,10 +1185,21 @@ class BatchExecutor:
                     correlation_id=call.call_id,
                     tenant_id=_tenant_id,
                     requested_by=_requested_by,
+                    abandoned=abandoned,
                 )
             )
         except (RuntimeError, OSError, ValueError, TimeoutError) as exc:
-            logger.warning("approval_gate_error", tool=call.tool, error=str(exc))
+            # The exception's text can carry anything its source put in it (a
+            # store's connection string, a policy engine's echo of the
+            # arguments), so WARNING gets its bounded type and DEBUG the text
+            # (#1276 R7, #1590). The caller is still told, in the CallResult.
+            logger.warning(
+                "approval_gate_error",
+                tool=call.tool,
+                call_id=call.call_id,
+                error_type=bounded_error_type(type(exc).__name__),
+            )
+            logger.debug("approval_gate_error_detail", tool=call.tool, call_id=call.call_id, error=str(exc))
             return CallResult(
                 index=call.index,
                 call_id=call.call_id,
@@ -1164,14 +1263,19 @@ class BatchExecutor:
         to one of them during the hold refuses the approved call.
         """
 
-        def _refuse(reason: str, code: str) -> CallResult:
+        def _refuse(reason: str, code: str, *, error_type: str | None = None) -> CallResult:
             logger.warning(
                 "approval_revalidation_failed",
                 approval_id=approval_id,
                 mcp_server=call.mcp_server,
                 tool=call.tool,
-                reason=reason,
+                # A revalidation that raised logs its bounded type here and its
+                # text at DEBUG below (#1590); every other reason is fixed text.
+                reason="revalidation error" if error_type is not None else reason,
+                error_type=error_type,
             )
+            if error_type is not None:
+                logger.debug("approval_revalidation_failed_detail", approval_id=approval_id, reason=reason)
             return CallResult(
                 index=call.index,
                 call_id=call.call_id,
@@ -1190,7 +1294,11 @@ class BatchExecutor:
             except (RuntimeError, OSError, ValueError, TimeoutError) as exc:
                 # Fail closed: an approval we cannot re-verify is not an
                 # approval we can act on.
-                return _refuse(f"revalidation error: {exc}", "ApprovalRevalidationError")
+                return _refuse(
+                    f"revalidation error: {exc}",
+                    "ApprovalRevalidationError",
+                    error_type=bounded_error_type(type(exc).__name__),
+                )
             if reason is not None:
                 return _refuse(reason, "ApprovalNoLongerValid")
 
@@ -1375,6 +1483,8 @@ class BatchExecutor:
         # front door so a selector is never silently inert on this surface --
         # a policy that reports enforcing while a rule cannot fire is the
         # failure this module already refuses for secret-pattern groups.
+        # Only headers the front door recorded as checked are bound; nothing
+        # records any for `hangar_call`, which declares no x-mcp-header (#1597).
         routing_token = bind_routing_headers(request_ctx)
 
         # Both bindings are this call's, so both tokens are reset in the finally
@@ -1490,7 +1600,13 @@ class BatchExecutor:
                                     break
 
                     except TimeoutError:
-                        # Global timeout exceeded
+                        # Global timeout exceeded. The gate that stopped a call
+                        # names it (#1541): a call not yet past the budget gate
+                        # reads `batch_timeout`; a call already held for approval
+                        # is not interrupted -- it reads its approval outcome, an
+                        # approval after this point is refused, recorded
+                        # `cancelled` and reads `CancellationError` (#1702) -- and
+                        # leaving the pool below waits for that hold to end.
                         logger.warning(
                             "batch_global_timeout",
                             batch_id=batch_id,
@@ -1644,6 +1760,22 @@ class BatchExecutor:
         Returns:
             CallResult for this call.
         """
+        roles_token = _bind_caller_roles(call)
+        try:
+            return self._execute_call_traced(call, cancel_event, global_timeout, batch_start_time, request_ctx)
+        finally:
+            if roles_token is not None:
+                identity_context_var.reset(roles_token)
+
+    def _execute_call_traced(
+        self,
+        call: CallSpec,
+        cancel_event: threading.Event,
+        global_timeout: float,
+        batch_start_time: float,
+        request_ctx: Any | None,
+    ) -> CallResult:
+        """`_execute_call` under the call's own span, with the caller's roles bound."""
         ctx = get_context()
         call_start = time.perf_counter()
 
@@ -1741,6 +1873,7 @@ class BatchExecutor:
         admitted = self._enforce_tenant_budget(pipeline)
         if isinstance(admitted, CallResult):
             _observe_gate("tenant_budget", pipeline, admitted)
+            _report_gate_refusal(pipeline, "tenant_budget", admitted)
             _observe_call(admitted, refused_by_gate=True)
             return admitted
         try:
@@ -1769,7 +1902,7 @@ class BatchExecutor:
                 name = gate.__name__.removeprefix("_gate_")
                 _observe_gate(name, p, refusal)
                 if refusal is not None:
-                    _log_gate_outcome(p, name, refusal)
+                    _report_gate_refusal(p, name, refusal)
                     return refusal
             passed = True
             return None
@@ -1828,7 +1961,7 @@ class BatchExecutor:
         cm = self.concurrency_manager
         with ExitStack() as permit:
             with pipeline.tracer.start_as_current_span("concurrency.acquire") as conc_span:
-                conc_span.set_attribute("mcp.server.id", call.mcp_server)
+                conc_span.set_attribute(McpServer.ID, call.mcp_server)
                 wait_s = permit.enter_context(cm.acquire(call.mcp_server))
                 conc_span.set_attribute("concurrency.wait_ms", round(wait_s * 1000, 2))
             if wait_s > 0.01:
@@ -1866,7 +1999,10 @@ class BatchExecutor:
     # run in.
 
     def _gate_cancelled_before_execution(self, p: "_CallPipeline") -> CallResult | None:
-        if p.cancel_event.is_set():
+        # A spent budget sets the event too: the collector's `as_completed`
+        # timed out. That call is the `global_timeout` gate's to refuse, so it
+        # reads `batch_timeout` whichever thread got there first (#1587).
+        if p.cancel_event.is_set() and _remaining_budget(p) > 0:
             # elapsed_ms is 0.0 rather than measured: nothing ran.
             return CallResult(
                 index=p.call.index,
@@ -1880,7 +2016,7 @@ class BatchExecutor:
 
     def _gate_global_timeout(self, p: "_CallPipeline") -> CallResult | None:
         """Refuse if the batch's budget is already spent, and set what is left."""
-        remaining_global = p.global_timeout - (time.perf_counter() - p.batch_start_time)
+        remaining_global = _remaining_budget(p)
         if remaining_global <= 0:
             return CallResult(
                 index=p.call.index,
@@ -1911,28 +2047,40 @@ class BatchExecutor:
         advances the group's strategy, so it is made once. The governance of a
         call naming a group, the group's scope and the selected member's,
         reads no membership.
+
+        The route -- which backend, and why -- is recorded from that one
+        selection, never reconstructed (#1286). A server named directly, a
+        group member included, is `standalone`: no group selected it.
         """
         p.mcp_server_obj = p.ctx.get_mcp_server(p.call.mcp_server)
         p.target_server_id = p.call.mcp_server
         if p.mcp_server_obj:
+            p.route_backend = p.call.mcp_server
+            record_route(p.call.mcp_server, RouteReason.STANDALONE.value)
             return None
 
         p.group_obj = GROUPS.get(p.call.mcp_server)
         if p.group_obj:
             p.is_group = True
-            selected_member = p.group_obj.select_member_for(p.caller_tenant_id)
-            if selected_member is None:
+            selection = p.group_obj.select_member_with_reason(p.caller_tenant_id)
+            if selection.member is None:
+                record_route(None, selection.reason.value)
                 return p.refuse(f"No available member in group '{p.call.mcp_server}'", "NoAvailableMemberError")
-            p.mcp_server_obj = selected_member
-            p.target_server_id = selected_member.id.value
+            p.mcp_server_obj = selection.member
+            p.target_server_id = selection.member.id.value
+            p.route_backend = p.target_server_id
+            record_route(p.target_server_id, selection.reason.value)
         elif not p.ctx.mcp_server_exists(p.call.mcp_server):
             return p.refuse(f"McpServer '{p.call.mcp_server}' not found", "McpServerNotFoundError")
+        else:
+            p.route_backend = p.call.mcp_server
+            record_route(p.call.mcp_server, RouteReason.STANDALONE.value)
         return None
 
     def _gate_tool_access(self, p: "_CallPipeline") -> CallResult | None:
         """Tool access policy, checked BEFORE starting the server or executing."""
         with p.tracer.start_as_current_span("policy.check_access") as policy_span:
-            policy_span.set_attribute("mcp.server.id", p.call.mcp_server)
+            policy_span.set_attribute(McpServer.ID, p.call.mcp_server)
             policy_span.set_attribute("gen_ai.tool.name", p.call.tool)
             policy_span.set_attribute("policy.is_group", p.is_group)
             if p.is_group:
@@ -2028,7 +2176,15 @@ class BatchExecutor:
                     unknown=DigestUnknownPolicy.BLOCK,
                     allowlist=frozenset({pin}),
                 )
-            ).validate_tool(projection.schema, p.call.mcp_server, p.call.call_id, tenant_id=p.caller_tenant_id)
+            ).validate_tool(
+                projection.schema,
+                p.call.mcp_server,
+                p.call.call_id,
+                tenant_id=p.caller_tenant_id,
+                # The upstream that serves the call -- the member a group selected, not
+                # the group -- so a pin bound to another upstream does not hold (#1802).
+                upstream=_upstream_of(p.mcp_server_obj) if pin.upstream is not None else None,
+            )
             blocked = digest_result.blocked
             event = digest_result.event
         except Exception:  # noqa: BLE001 -- a malformed projection schema must not 500 the call path
@@ -2245,7 +2401,7 @@ class BatchExecutor:
         (mcp_server-specific or _global fallback).
         """
         with p.tracer.start_as_current_span("approval_gate.check") as approval_span:
-            approval_span.set_attribute("mcp.server.id", p.call.mcp_server)
+            approval_span.set_attribute(McpServer.ID, p.call.mcp_server)
             approval_span.set_attribute("gen_ai.tool.name", p.call.tool)
             approval_result = self._check_approval_gate(
                 p.call,
@@ -2254,6 +2410,7 @@ class BatchExecutor:
                 tenant_id=p.caller_tenant_id,
                 scopes=p.policy_scopes(),
                 governance=p.governance,
+                abandoned=p.cancel_event,
             )
             if approval_result is not None:
                 approval_span.set_attribute("approval.result", approval_result.error_type or "denied")
@@ -2268,6 +2425,7 @@ class BatchExecutor:
             # a tool or tightening a policy while a decision is pending left the
             # held call to dispatch on the superseded decision.
             granted_id = getattr(_approval_loop_local, "approval_id", None)
+            p.granted_approval_id = granted_id
             if granted_id is not None:
                 # Any pin stands for "there is something to re-verify". The
                 # callback re-verifies all of them, the group pins of a member
@@ -2321,6 +2479,36 @@ class BatchExecutor:
             return "not_required"
         return "unavailable" if l7_rule is not None else "not_required"
 
+    def _l7_refuses_without_a_start(self, p: "_CallPipeline") -> bool:
+        """Whether the target's enforced L7 policy will refuse this call, so starting it would be for nothing.
+
+        True for a deny, and for a requireApproval nobody granted: the aggregate
+        raises on both before it wakes the server. Audit mode never refuses, and
+        a call with a pin check still to run is left to start, because that check
+        reads the catalogue the start publishes (#601). Read-only: the verdict the
+        aggregate reaches is the one recorded. The arguments are the call's own;
+        a mutator that rewrites them after this point can only make the aggregate
+        allow what this predicted a refusal for, and the aggregate then starts the
+        server itself.
+        """
+        if p.digest_pin_deferred:
+            return False
+        try:
+            policy = p.governance.l7_policy
+            if policy is None:
+                return False
+            from mcp_hangar.context import get_routing_headers
+            from mcp_hangar.domain.policies.egress_l7 import PolicyMode, ToolAction, evaluate
+
+            if policy.mode is not PolicyMode.ENFORCE:
+                return False
+            action = evaluate(p.call.tool, p.call.arguments or {}, policy, get_routing_headers()).action
+        except Exception:  # noqa: BLE001 -- a prediction must never decide the call: start as before
+            return False
+        if action is ToolAction.DENY:
+            return True
+        return action is ToolAction.REQUIRE_APPROVAL and getattr(_approval_loop_local, "approval_id", None) is None
+
     def _gate_cold_start(self, p: "_CallPipeline") -> CallResult | None:
         """Single-flight cold start of the resolved target.
 
@@ -2339,8 +2527,17 @@ class BatchExecutor:
             refusal = self._refuse_dead_target(p)
             if refusal is not None:
                 return self._report_refusal(p, refusal)
+        if self._l7_refuses_without_a_start(p):
+            # The aggregate refuses this call before it reaches ensure_ready, with
+            # the event and the record a refusal carries. Starting the server here
+            # first made a denied call spawn it and run initialize and tools/list
+            # upstream (#1708).
+            p.note(Gate.SKIP, "l7_refuses")
+            return None
         with p.tracer.start_as_current_span("mcp_server.cold_start") as cs_span:
-            cs_span.set_attribute("mcp.server.id", p.target_server_id)
+            # The target the caller named; the member a group selected is the backend (#1286).
+            cs_span.set_attribute(McpServer.ID, p.call.mcp_server)
+            cs_span.set_attribute(Route.BACKEND, p.target_server_id)
             try:
                 self._single_flight.do(
                     p.target_server_id,
@@ -2396,7 +2593,30 @@ class BatchExecutor:
     def _gate_cancelled_after_cold_start(self, p: "_CallPipeline") -> CallResult | None:
         if not p.cancel_event.is_set():
             return None
+        self._cancel_granted_approval(p)
         return p.refuse("Cancelled after cold start", "CancellationError")
+
+    @staticmethod
+    def _cancel_granted_approval(p: "_CallPipeline") -> None:
+        """Record a granted approval as cancelled when its call is cancelled before dispatch (#1730).
+
+        The grant was published when the hold ended; a call refused after that
+        did not run, and the trail must not read as a grant that took effect.
+        A failure to record it is logged and does not change the refusal.
+        """
+        if p.granted_approval_id is None:
+            return
+        gate_service = getattr(p.ctx, "approval_gate", None)
+        if gate_service is None or not hasattr(gate_service, "cancel_after_grant"):
+            return
+        try:
+            _run_approval_coroutine(gate_service.cancel_after_grant(p.granted_approval_id))
+        except Exception as exc:  # noqa: BLE001 -- the call is already refused; this only annotates the trail
+            logger.warning(
+                "approval_cancel_after_grant_failed",
+                approval_id=p.granted_approval_id,
+                error_type=bounded_error_type(type(exc).__name__),
+            )
 
     def _relay_upstream_task(self, p: "_CallPipeline", result: CallResult) -> CallResult | None:
         """Upstream MCP task handle (ADR-014 P3).
@@ -2444,6 +2664,8 @@ class BatchExecutor:
                     upstream=result.result,
                     logical_mcp_server=p.call.mcp_server,
                     tool=p.call.tool,
+                    # Read inside `batch.call.<tool>`: the span this call's task links back to.
+                    origin_traceparent=current_traceparent(),
                 ),
             )
         logger.warning(
@@ -2506,11 +2728,15 @@ class BatchExecutor:
         # Which attempt is running, so each `command.send` span says which one it
         # is (#1287). A list, not an int, because `do_invoke` closes over it.
         attempt_index = [0]
+        # The L7 verdict of the latest attempt (#1295): a refusal is never
+        # retried, so the last attempt's verdict is the call's.
+        l7_holder = [L7VerdictHolder()]
 
         def do_invoke() -> dict[str, Any]:
             attempt_index[0] += 1
             with tracer.start_as_current_span("command.send.InvokeToolCommand") as cmd_span:
-                cmd_span.set_attribute("mcp.server.id", dispatch_server_id)
+                cmd_span.set_attribute(McpServer.ID, call.mcp_server)
+                cmd_span.set_attribute(Route.BACKEND, dispatch_server_id)
                 cmd_span.set_attribute("gen_ai.tool.name", call.tool)
                 cmd_span.set_attribute("command.timeout", effective_timeout)
                 cmd_span.set_attribute(Retry.INDEX, attempt_index[0])
@@ -2524,8 +2750,13 @@ class BatchExecutor:
                     # when nothing was granted, and deny still wins inside.
                     l7_approval_id=getattr(_approval_loop_local, "approval_id", None),
                     progress_token=call.progress_token,
+                    # What the caller named, so the call's audit record is
+                    # keyed on the group and not the member (#1594).
+                    logical_target=call.mcp_server,
                 )
-                result = ctx.command_bus.send(command)
+                l7_holder[0] = L7VerdictHolder()
+                with holding_l7_verdict(l7_holder[0]):
+                    result = ctx.command_bus.send(command)
                 cmd_span.set_attribute("command.result", "success")
                 return cast(dict[str, Any], result)
 
@@ -2536,7 +2767,7 @@ class BatchExecutor:
             with tracer.start_as_current_span("invoke_with_retry") as retry_span:
                 retry_span.set_attribute("retry.max_attempts", policy.max_attempts)
                 retry_span.set_attribute("retry.backoff", str(policy.backoff))
-                retry_span.set_attribute("mcp.server.id", call.mcp_server)
+                retry_span.set_attribute(McpServer.ID, call.mcp_server)
                 retry_span.set_attribute("gen_ai.tool.name", call.tool)
                 retry_result = retry_sync(
                     operation=do_invoke,
@@ -2553,6 +2784,7 @@ class BatchExecutor:
                 retry_span.set_attribute("retry.attempts", retry_result.attempt_count)
                 retry_span.set_attribute("retry.success", retry_result.success)
                 retry_span.set_attribute(Retry.OUTCOME, _retry_outcome(retry_result))
+            l7 = _l7_decision(l7_holder[0])
             if retry_result.success:
                 result = retry_result.result
             else:
@@ -2561,7 +2793,8 @@ class BatchExecutor:
                 error_type = type(retry_result.final_error).__name__ if retry_result.final_error else "UnknownError"
                 error_msg = str(retry_result.final_error) if retry_result.final_error else "Unknown error"
 
-                _log_call_failure(call, retry_result.final_error, error_type, elapsed_ms)
+                _log_call_failure(call, retry_result.final_error, error_type, elapsed_ms, l7)
+                _publish_l7_refusal(ctx, call, error_type, elapsed_ms, l7, dispatch_server_id)
 
                 return CallResult(
                     index=call.index,
@@ -2571,6 +2804,8 @@ class BatchExecutor:
                     error_type=error_type,
                     elapsed_ms=elapsed_ms,
                     member_outcome=member_outcome(retry_result.final_error),
+                    upstream_result=_upstream_result_of(retry_result.final_error),
+                    l7_evaluator_failed=l7 is not None and l7.evaluator_failed,
                     retry_metadata=RetryMetadata(
                         attempts=retry_result.attempt_count,
                         retries=[a.error_type for a in retry_result.attempts],
@@ -2584,8 +2819,10 @@ class BatchExecutor:
             except Exception as e:  # noqa: BLE001 -- fault-barrier: tool invocation failure must return error result, not crash batch
                 elapsed_ms = (time.perf_counter() - call_start) * 1000
                 error_type = type(e).__name__
+                l7 = _l7_decision(l7_holder[0])
 
-                _log_call_failure(call, e, error_type, elapsed_ms)
+                _log_call_failure(call, e, error_type, elapsed_ms, l7)
+                _publish_l7_refusal(ctx, call, error_type, elapsed_ms, l7, dispatch_server_id)
 
                 return CallResult(
                     index=call.index,
@@ -2595,39 +2832,20 @@ class BatchExecutor:
                     error_type=error_type,
                     elapsed_ms=elapsed_ms,
                     member_outcome=member_outcome(e),
+                    upstream_result=_upstream_result_of(e),
+                    l7_evaluator_failed=l7 is not None and l7.evaluator_failed,
                 )
+            else:
+                _l7_decision(l7_holder[0])
 
         # Interceptor mutators (response): transform the returned result payload
-        # after a successful invoke, before the size check and building the
-        # success CallResult. Empty pipeline (default) returns it unchanged.
+        # after a successful invoke, before building the success CallResult.
+        # Empty pipeline (default) returns it unchanged. A result over the read
+        # limit never gets here: the transport failed the call with
+        # `ResponseTooLarge` before it was held (#1613).
         result = self._mutate("tools/call", "response", cast(dict[str, Any], result), call.call_id)
 
         elapsed_ms = (time.perf_counter() - call_start) * 1000
-
-        # Check response size and truncate if needed
-        truncated = False
-        truncated_reason = None
-        original_size = None
-
-        result_json = json.dumps(result)
-        result_size = len(result_json.encode("utf-8"))
-
-        # A call whose caller takes the whole result is not cut (#1453).
-        if result_size > MAX_RESPONSE_SIZE_BYTES and not call.whole_result:
-            truncated = True
-            truncated_reason = "response_size_exceeded"
-            original_size = result_size
-            result = None
-            BATCH_TRUNCATIONS_TOTAL.inc(reason="per_call")
-            record_result_drop(truncated_reason, result_size, MAX_RESPONSE_SIZE_BYTES)
-            logger.warning(
-                "batch_call_truncated",
-                call_id=call.call_id,
-                mcp_server=call.mcp_server,
-                tool=call.tool,
-                size_bytes=result_size,
-                limit_bytes=MAX_RESPONSE_SIZE_BYTES,
-            )
 
         logger.debug(
             "batch_call_completed",
@@ -2654,11 +2872,27 @@ class BatchExecutor:
             success=True,
             result=result,
             elapsed_ms=elapsed_ms,
-            truncated=truncated,
-            truncated_reason=truncated_reason,
-            original_size_bytes=original_size,
             retry_metadata=retry_meta,
         )
+
+
+def _upstream_result_of(error: BaseException | None) -> dict[str, Any] | None:
+    """The result an upstream sent with ``isError: true``, as the aggregate kept it (#1900).
+
+    Relayed untouched: Hangar neither adds to nor rewrites what the upstream said,
+    and never replaces an upstream's remediation hint with one of its own. A
+    failure Hangar raises itself carries Hangar's reason in ``error``, not here.
+    """
+    details = getattr(error, "details", None)
+    if not isinstance(details, dict) or not details.get("is_error"):
+        return None
+    result = details.get("result")
+    return result if isinstance(result, dict) else None
+
+
+def _remaining_budget(p: _CallPipeline) -> float:
+    """What is left of the batch's global budget, in seconds; zero or less when it is spent."""
+    return p.global_timeout - (time.perf_counter() - p.batch_start_time)
 
 
 def _gate_decision(p: _CallPipeline, refusal: CallResult | None) -> tuple[str, str | None, str | None]:
@@ -2678,6 +2912,23 @@ def _gate_decision(p: _CallPipeline, refusal: CallResult | None) -> tuple[str, s
     return Gate.ALLOW, None, None
 
 
+def _l7_decision(holder: L7VerdictHolder) -> L7Decision | None:
+    """The L7 verdict of the call's last attempt, bounded and set on its span (#1295). Never raises.
+
+    One reading for both sinks, as `_gate_decision` is for a gate: the span's
+    `hangar.l7.*` and the refusal's log line come from this value, and nothing
+    classifies the call again or evaluates the policy a second time.
+    """
+    try:
+        decision = bounded_l7_decision(holder.verdict)
+        if decision is not None:
+            record_l7_decision(decision)
+        return decision
+    except Exception:  # noqa: BLE001 -- fault barrier: telemetry must not break a call
+        logger.debug("l7_observation_failed")
+        return None
+
+
 def _log_gate_outcome(p: _CallPipeline, gate: str, refusal: CallResult) -> None:
     """Log the gate that stopped this call: one line, at the level it deserves.
 
@@ -2688,11 +2939,20 @@ def _log_gate_outcome(p: _CallPipeline, gate: str, refusal: CallResult) -> None:
     line the gate wrote for itself, under its own name and at its own level, so
     "which calls were refused yesterday" had no single answer (ADR-029 s5).
 
+    A refusal carries no free text (#1581). `refusal.error` is the message the
+    caller is told, and a gate fills it from text it does not bound: an
+    approver's own reason, a validator's reason, the server name the caller
+    typed. The data-handling contract allows a log line identifiers and bounded
+    codes (#1276), and `reason` and `error_type` already say why.
+
     A gate that broke rather than refused keeps `batch_call_failed` at debug, as
-    the invoke path does for a failure.
+    the invoke path does for a failure, and keeps `error` there: what broke is
+    in the exception text, and the contract forbids upstream text at INFO and
+    above only. The redaction and length processors still apply to it.
     """
     outcome, reason, _revision = _gate_decision(p, refusal)
     refused = outcome == Gate.DENY
+    fields: dict[str, Any] = {} if refused else {"error": refusal.error}
     log = logger.warning if refused else logger.debug
     log(
         "batch_call_refused" if refused else "batch_call_failed",
@@ -2702,10 +2962,71 @@ def _log_gate_outcome(p: _CallPipeline, gate: str, refusal: CallResult) -> None:
         tenant_id=p.caller_tenant_id,
         gate=gate,
         reason=reason,
-        error=refusal.error,
         error_type=refusal.error_type,
         elapsed_ms=round(refusal.elapsed_ms, 2),
+        **fields,
     )
+
+
+def publish_call_refused(
+    event_bus: Any,
+    call: CallSpec,
+    elapsed_ms: float,
+    identity: IdentityContext | None,
+    *,
+    gate: str | None = None,
+    reason: str | None = None,
+    l7: L7Decision | None = None,
+    route_backend: str | None = None,
+) -> None:
+    """Publish the one `ToolCallRefused` audit exports for a refused call (#1582). Never raises.
+
+    Called where the refusal is logged, from the same bounded decision: a gate's
+    name and reason from `_gate_decision`, or the L7 verdict from `_l7_decision`.
+    Nothing here reads the refusal's message, which carries text the gate was
+    handed (an approver's reason, a validator's), so no free text reaches the
+    record. A publish that fails is logged, and the call is still refused.
+    """
+    try:
+        event_bus.publish(
+            ToolCallRefused(
+                mcp_server_id=call.mcp_server,
+                tool_name=call.tool,
+                correlation_id=call.call_id,
+                identity_context=identity.to_dict() if identity is not None else None,
+                gate=gate,
+                gate_reason=reason,
+                l7_verdict=l7.verdict if l7 is not None else None,
+                l7_mode=l7.mode if l7 is not None else None,
+                l7_rule_kind=l7.rule_kind if l7 is not None else None,
+                l7_policy_id=l7.policy_id if l7 is not None else None,
+                elapsed_ms=round(elapsed_ms, 2),
+                route_backend=route_backend,
+            )
+        )
+    except Exception as e:  # noqa: BLE001 -- fault barrier: the refusal stands whether or not its record is written
+        logger.warning("tool_call_refused_not_published", call_id=call.call_id, error_type=type(e).__name__)
+
+
+def _publish_gate_refusal(p: _CallPipeline, gate: str, refusal: CallResult) -> None:
+    """Publish `ToolCallRefused` for a gate that said `deny`; a gate that broke (`error`) is no refusal."""
+    outcome, reason, _revision = _gate_decision(p, refusal)
+    if outcome == Gate.DENY:
+        publish_call_refused(
+            p.ctx.event_bus,
+            p.call,
+            refusal.elapsed_ms,
+            get_identity_context(),
+            gate=gate,
+            reason=reason,
+            route_backend=p.route_backend,
+        )
+
+
+def _report_gate_refusal(p: _CallPipeline, gate: str, refusal: CallResult) -> None:
+    """Log and audit a refusal by *gate*, in `_run_gates` or after it, from one `_gate_decision` (#1629)."""
+    _log_gate_outcome(p, gate, refusal)
+    _publish_gate_refusal(p, gate, refusal)
 
 
 def _observe_gate(name: str, p: _CallPipeline, refusal: CallResult | None) -> None:
@@ -2727,7 +3048,9 @@ def _observe_call(result: CallResult, *, refused_by_gate: bool) -> None:
         error_type = result.error_type or ""
         if result.success:
             outcome = Gate.ALLOW
-        elif error_type in _GATE_ERRORS:
+        elif error_type in _GATE_ERRORS or result.l7_evaluator_failed:
+            # An L7 refusal of arguments it could not inspect: the verdict is a
+            # denial, but the evaluator broke (#1295, ADR-029 s5).
             outcome = Gate.ERROR
         elif refused_by_gate or error_type in _REFUSED_AT_DISPATCH:
             outcome = Gate.DENY
@@ -2767,6 +3090,9 @@ def format_result_dict(result: CallResult) -> dict[str, Any]:
 
     if result.retry_metadata:
         d["retry_metadata"] = result.retry_metadata.to_dict()
+
+    if result.upstream_result is not None:
+        d["upstream_result"] = result.upstream_result
 
     return d
 

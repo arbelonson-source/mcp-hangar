@@ -68,6 +68,29 @@ class McpServerNotFoundError(McpServerError):
         )
 
 
+class McpServerDeclaredInConfigError(McpServerError):
+    """The server to delete is declared in the gateway's configuration.
+
+    Deleting it through the API used to work until the next reload or restart,
+    which brought it back: a removal that said it succeeded and then undid
+    itself. The Kubernetes operator sent that delete for every MCPServer CR it
+    deleted, and a remote CR mirrors a server the configuration declares, so
+    deleting the mirror took the real server out of the pool (#1744). The
+    configuration is where such a server is removed; stopping it is how it is
+    taken out of service for now.
+    """
+
+    def __init__(self, mcp_server_id: str):
+        super().__init__(
+            message=(
+                f"McpServer {mcp_server_id} is declared in the gateway configuration; remove it from the "
+                "configuration and reload, or stop it to take it out of service"
+            ),
+            mcp_server_id=mcp_server_id,
+            operation="delete",
+        )
+
+
 class McpServerStartError(McpServerError):
     """Raised when a mcp_server fails to start.
 
@@ -420,6 +443,24 @@ class ClientTimeoutError(ClientError):
             details={"timeout_s": timeout, "operation": operation},
         )
         self.timeout = timeout
+
+
+class ResponseTooLarge(ClientError):
+    """An upstream response went past the read-time limit and was not read whole (#1613).
+
+    Raised by the transport that was reading it, so it fails the call the same
+    way over stdio and HTTP, on ``hangar_call`` and on a flat call. An
+    operational failure, not a refusal: the upstream was asked and answered.
+    The message names the limit and nothing the upstream sent.
+    """
+
+    def __init__(self, limit_bytes: int, mcp_server_id: str = ""):
+        super().__init__(
+            message=f"The upstream response exceeded the limit of {limit_bytes} bytes and was not read.",
+            mcp_server_id=mcp_server_id,
+            details={"limit_bytes": limit_bytes},
+        )
+        self.limit_bytes = limit_bytes
 
 
 # --- Validation Exceptions ---
@@ -914,15 +955,52 @@ class MissingSecretsError(MCPError):
 
 
 class UnverifiedMcpServerError(MCPError):
-    """Attempted to load an unverified mcp_server without explicit flag."""
+    """Attempted to load a registry entry that is not verified.
 
-    def __init__(self, mcp_server_name: str):
+    Verified is a trusted namespace and an entry the registry lists as active.
+    The message names the operator's decision, not an argument for the caller
+    to retry with: the caller is an agent, and what it reads here a registry
+    entry's own text can steer.
+    """
+
+    def __init__(
+        self,
+        mcp_server_name: str,
+        *,
+        force_ignored: bool = False,
+        published: bool = True,
+        trusted: bool = False,
+    ):
+        if trusted:
+            # Only the second condition failed: a namespace cannot fix it.
+            message = (
+                f"McpServer {mcp_server_name!r} is not verified: the registry no longer lists it as active "
+                "(deprecated or deleted). Whether it may be loaded anyway is the operator's decision, made in "
+                "config.yaml: set `hot_loading.allow_force_unverified: true`."
+            )
+        else:
+            message = (
+                f"McpServer {mcp_server_name!r} is not verified: its registry name is in no namespace listed in "
+                "`hot_loading.trusted_namespaces`. Whether it may be loaded is the operator's decision, made in "
+                "config.yaml: list its namespace in `hot_loading.trusted_namespaces`, or set "
+                "`hot_loading.allow_force_unverified: true`."
+            )
+        if force_ignored:
+            message += " force_unverified was ignored, because `hot_loading.allow_force_unverified` is not set."
         super().__init__(
-            message=f"McpServer '{mcp_server_name}' is not verified. Use force_unverified=True to load.",
+            message=message,
             operation="load",
-            details={"mcp_server_name": mcp_server_name},
+            details={
+                "mcp_server_name": mcp_server_name,
+                "force_ignored": force_ignored,
+                "published": published,
+                "trusted": trusted,
+            },
         )
         self.mcp_server_name = mcp_server_name
+        self.force_ignored = force_ignored
+        self.published = published
+        self.trusted = trusted
 
 
 class McpServerAlreadyLoadedError(MCPError):

@@ -38,6 +38,13 @@ class FakeRepository:
             if r.state == state and (mcp_server_id is None or r.mcp_server_id == mcp_server_id)
         ]
 
+    async def transition(self, approval_id, from_states, state, decided_by, decided_at, reason):
+        current = await self.get(approval_id)
+        if current is None or current.state not in from_states:
+            return False
+        await self.update_state(approval_id, state, decided_by, decided_at, reason)
+        return True
+
     async def update_state(self, approval_id, state, decided_by, decided_at, reason):
         req = self._store.get(approval_id)
         if req:
@@ -216,10 +223,10 @@ class TestApprovalGateServiceCheck:
 
         captured_id = None
 
-        async def capturing_register(approval_id):
+        async def capturing_register(approval_id, **kwargs):
             nonlocal captured_id
             captured_id = approval_id
-            await original_register(approval_id)
+            await original_register(approval_id, **kwargs)
 
         hold_registry.register = capturing_register
 
@@ -255,10 +262,10 @@ class TestApprovalGateServiceCheck:
         captured_id = None
         original_register = hold_registry.register
 
-        async def capturing_register(approval_id):
+        async def capturing_register(approval_id, **kwargs):
             nonlocal captured_id
             captured_id = approval_id
-            await original_register(approval_id)
+            await original_register(approval_id, **kwargs)
 
         hold_registry.register = capturing_register
 

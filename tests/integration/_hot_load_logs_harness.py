@@ -22,9 +22,11 @@ runtime store, the buffer registry, the endpoint -- is the real one, and the
 handler under test is built exactly as ``server/bootstrap/hot_loading.py``
 builds it, including the ``LogBuffers`` port.
 
-``kept`` is declared in the file and is the delete case: ``hangar_unload``
-refuses a configured server, and ``DeleteMcpServerHandler`` works on the
-repository, where a hot-loaded server never is.
+``added`` is the delete case: a server added through ``POST
+/api/mcp_servers``, because ``hangar_unload`` refuses a configured server,
+``DeleteMcpServerHandler`` works on the repository, where a hot-loaded server
+never is, and refuses one the file declares (#1744). ``kept`` is declared in the
+file, and its refused delete must leave its log where it was.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ from _reload_keeps_harness import MOCK_PROVIDER, _server
 from _reload_served_harness import BASE_URL, _served_app, _write
 
 #: What each server writes to its own stderr at startup.
-BANNERS = {"kept": "kept is up", "hot-one": "hot-one is up", "hot-two": "hot-two is up"}
+BANNERS = {"kept": "kept is up", "added": "added is up", "hot-one": "hot-one is up", "hot-two": "hot-two is up"}
 
 
 def _config() -> dict[str, Any]:
@@ -60,7 +62,7 @@ def _config() -> dict[str, Any]:
 class _FakeRegistry:
     """Answers for any name in BANNERS, so `hangar_load` resolves without a registry."""
 
-    async def get_server(self, server_id: str) -> Any:
+    async def get_server(self, server_id: str, *, fresh: bool = False) -> Any:
         from mcp_hangar.domain.contracts.registry import PackageInfo, ServerDetails, TransportInfo
 
         if server_id not in BANNERS:
@@ -71,7 +73,7 @@ class _FakeRegistry:
             description="a hot-loaded server",
             vendor=None,
             source_url=None,
-            is_official=True,
+            is_published=True,
             packages=[
                 PackageInfo(
                     registry_type="pypi",
@@ -128,8 +130,15 @@ def _load_handler(context: Any) -> Any:
     from mcp_hangar.application.commands.load_handlers import LoadMcpServerHandler
     from mcp_hangar.application.services.secrets_resolver import SecretsResolver
     from mcp_hangar.domain.model import McpServer
+    from mcp_hangar.domain.security.hot_load_trust import HotLoadTrust
     from mcp_hangar.server.bootstrap.logs import LogBuffers
     from mcp_hangar.server.state import get_runtime, get_runtime_mcp_servers
+
+    class TrustsEveryName(HotLoadTrust):
+        """What this harness loads is in no namespace, and trust is not what it tests."""
+
+        def is_trusted(self, server_name: str) -> bool:
+            return True
 
     return LoadMcpServerHandler(
         registry_client=_FakeRegistry(),
@@ -141,6 +150,7 @@ def _load_handler(context: Any) -> Any:
         mcp_server_factory=lambda **kwargs: McpServer(**kwargs),
         mcp_server_repository=get_runtime().repository,
         log_buffers=LogBuffers(),
+        trust=TrustsEveryName,
     )
 
 
@@ -155,6 +165,10 @@ class _HotGateway(_LogGateway):
 
     def delete(self, mcp_server: str) -> int:
         return self.client.delete(f"/api/mcp_servers/{mcp_server}").status_code
+
+    def add(self, mcp_server: str) -> int:
+        body = {"mcp_server_id": mcp_server, **_server(env={"MOCK_STDERR_BANNER": BANNERS[mcp_server]})}
+        return self.client.post("/api/mcp_servers", json=body).status_code
 
 
 def run(workdir: Path) -> dict[str, Any]:
@@ -226,11 +240,23 @@ def run(workdir: Path) -> dict[str, Any]:
         # A second one, loaded and then deleted rather than unloaded, to show
         # the release is not the unload path's alone.
         gateway.load("hot-two")
-        out["deleted"] = {
+        added = gateway.add("added")
+        out["added"] = {
+            "status": added,
+            "logs": gateway.started("added", BANNERS["added"]),
+            "wired": wired("added"),
+            "registered": get_log_buffer("added") is not None,
+        }
+        out["refused"] = {
             "status": gateway.delete("kept"),
-            "logs": gateway.logs("kept"),
-            "registered": get_log_buffer("kept") is not None,
             "in_repository": repository.exists("kept"),
+            "wired": wired("kept"),
+        }
+        out["deleted"] = {
+            "status": gateway.delete("added"),
+            "logs": gateway.logs("added"),
+            "registered": get_log_buffer("added") is not None,
+            "in_repository": repository.exists("added"),
             # Untouched by the delete beside it.
             "hot_two_registered": get_log_buffer("hot-two") is not None,
             "hot_two_logs": gateway.logs_holding("hot-two", BANNERS["hot-two"]),

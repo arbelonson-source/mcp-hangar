@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from ...application.ports.observability import ObservabilityPort
 from ...logging_config import get_logger
 from .composition import get_persistence_backend
 
@@ -146,8 +145,14 @@ def build_approval_service(config: dict[str, Any], event_bus: Any = None) -> Any
         return None
 
     try:
+        state_dir = absolute_state_dir(config)
+        database_config = None
+        if state_dir:
+            database_config = _import_attribute("mcp_hangar.infrastructure.persistence.database", "DatabaseConfig")(
+                path=str(state_dir / "mcp_hangar.db")
+            )
         return bootstrap_approvals(
-            database=get_database(),
+            database=get_database(database_config),
             event_bus=event_bus,
             config=config,
             repository=_approval_repository_from_backend(),
@@ -281,6 +286,21 @@ def attach_component_app_state(app: Any) -> None:
     app.state.approval_gate_service = approval_gate
 
 
+def absolute_state_dir(config: dict[str, Any]) -> Path | None:
+    """The directory of an absolute ``event_store.path``, or None when there is not one (#1772).
+
+    The files Hangar keeps besides the event store -- the saga state, the approvals
+    database -- default to ``data/`` relative to the working directory. A client
+    spawns Hangar from a directory of its choosing, possibly one nobody can
+    write, so a configuration that names an absolute event store has chosen where
+    state lives, and they follow it. One that does not keeps the defaults.
+    """
+    path = (config.get("event_store") or {}).get("path")
+    if not path or not Path(str(path)).is_absolute():
+        return None
+    return Path(str(path)).parent
+
+
 def create_persistent_event_store(driver: str, config: dict[str, Any]) -> Any | None:
     """Build a persistent event store for the given driver, if supported."""
     if driver != "sqlite":
@@ -293,20 +313,3 @@ def create_persistent_event_store(driver: str, config: dict[str, Any]) -> Any | 
     db_path = config.get("path", "data/events.db")
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     return sqlite_event_store(db_path)
-
-
-def create_observability_adapter(config: Any) -> ObservabilityPort | None:
-    """Build the Langfuse observability adapter from config."""
-    langfuse_config = _import_attribute("mcp_hangar.integrations.langfuse", "LangfuseConfig")
-    adapter_type = _import_attribute("mcp_hangar.integrations.langfuse", "LangfuseObservabilityAdapter")
-
-    adapter_config = langfuse_config(
-        enabled=True,
-        public_key=config.public_key,
-        secret_key=config.secret_key,
-        host=config.host,
-        sample_rate=config.sample_rate,
-        scrub_inputs=config.scrub_inputs,
-        scrub_outputs=config.scrub_outputs,
-    )
-    return cast(ObservabilityPort, adapter_type(adapter_config))

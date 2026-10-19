@@ -9,7 +9,11 @@ as its own `batch.truncate` span.
 Every test drives `BatchExecutor.execute` with a real SDK exporter behind
 `_TextFreeTracer`, the wrapper `get_tracer()` returns in production, so the
 failure outcome asserted here is the one an operator sees. Truncation runs the
-real `TruncationManager` with a small budget.
+real `TruncationManager` with a small budget. The last tests pin the bounds:
+a canary in either payload reaches no span, nor does a continuation id, and a
+direction outside its closed list is not exported. A response over the size
+limit is failed by the transport before it is held (#1613), so it is an
+error on the call span, not a shaping event.
 """
 
 from __future__ import annotations
@@ -23,9 +27,10 @@ from opentelemetry.trace import StatusCode
 
 from mcp_hangar.application.services.mutator_pipeline import MutatorPipeline
 from mcp_hangar.domain.contracts.mutator import MutationContext, MutationResult
+from mcp_hangar.domain.exceptions import ResponseTooLarge
 from mcp_hangar.observability.conventions import Shaping
 from mcp_hangar.server.bootstrap.truncation import init_truncation, reset_truncation
-from mcp_hangar.server.tools.batch import MAX_RESPONSE_SIZE_BYTES, BatchExecutor, CallSpec
+from mcp_hangar.server.tools.batch import BatchExecutor, CallSpec
 
 _TOOL = "add"
 
@@ -53,9 +58,8 @@ class _Mutator:
         return MutationResult(payload=self._rewrite, changed=True)
 
 
-@pytest.fixture
-def exporter() -> Iterator[Any]:
-    """A real TracerProvider behind `_TextFreeTracer`, patched into the executor."""
+def _memory_tracer() -> tuple[Any, Any]:
+    """An in-memory exporter, and the `_TextFreeTracer` production wraps around a real SDK tracer."""
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -65,7 +69,13 @@ def exporter() -> Iterator[Any]:
     memory = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(memory))
-    tracer = _TextFreeTracer(provider.get_tracer("test-1298"))
+    return memory, _TextFreeTracer(provider.get_tracer("test-1298"))
+
+
+@pytest.fixture
+def exporter() -> Iterator[Any]:
+    """A real TracerProvider behind `_TextFreeTracer`, patched into the executor."""
+    memory, tracer = _memory_tracer()
     with patch("mcp_hangar.server.tools.batch.executor.get_tracer", return_value=tracer):
         yield memory
 
@@ -99,7 +109,10 @@ def upstream() -> Iterator[Mock]:
 
 @pytest.fixture
 def oversized_upstream() -> Iterator[Mock]:
-    yield from _upstream({"data": "x" * (MAX_RESPONSE_SIZE_BYTES + 1000)})
+    """The transport stopped reading the response past the limit (#1613)."""
+    for ctx in _upstream({}):
+        ctx.command_bus.send.side_effect = ResponseTooLarge(1024)
+        yield ctx
 
 
 def _run(executor: BatchExecutor, calls: int = 1) -> Any:
@@ -166,18 +179,17 @@ def test_a_failing_mutator_ends_the_call_span_in_error(exporter: Any, upstream: 
     assert all("exception.message" not in e.attributes for e in span.events)
 
 
-def test_an_oversized_result_records_the_drop(exporter: Any, oversized_upstream: Mock) -> None:
+def test_an_oversized_response_fails_the_call_span_and_records_no_drop(exporter: Any, oversized_upstream: Mock) -> None:
+    """An operational failure, typed, and not a shaping event: nothing was dropped after it was held (#1613)."""
     result = _run(BatchExecutor())
 
     [call] = result.results
-    assert call.truncated_reason == "response_size_exceeded"
+    assert not call.success and call.error_type == "ResponseTooLarge"
+    assert not call.truncated and call.truncated_reason is None
     [span] = _call_spans(exporter)
-    [drop] = _events(span, Shaping.DROP_EVENT)
-    assert drop == {
-        Shaping.REASON: "response_size_exceeded",
-        Shaping.SIZE_BYTES: call.original_size_bytes,
-        Shaping.LIMIT_BYTES: MAX_RESPONSE_SIZE_BYTES,
-    }
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.attributes["error.type"] == "ResponseTooLarge"
+    assert [e.name for e in span.events if e.name.startswith("hangar.shaping.")] == []
 
 
 @pytest.fixture
@@ -214,3 +226,79 @@ def test_no_truncation_manager_means_no_truncate_span(exporter: Any, upstream: M
     _run(BatchExecutor())
 
     assert [s for s in exporter.get_finished_spans() if s.name == "batch.truncate"] == []
+
+
+def test_every_call_takes_its_result_whole_means_no_truncate_span(
+    exporter: Any, small_truncation_budget: None, upstream: Mock
+) -> None:
+    """A flat tool's call is never budgeted (#1453), so there is no truncation to observe."""
+    upstream.command_bus.send.return_value = {"data": "y" * 600}
+    spec = CallSpec(index=0, call_id="call-0", mcp_server="math", tool=_TOOL, arguments={}, whole_result=True)
+
+    result = BatchExecutor().execute(
+        batch_id="b-1298", calls=[spec], max_concurrency=1, global_timeout=30.0, fail_fast=False
+    )
+
+    assert result.results[0].truncated is False
+    assert [s for s in exporter.get_finished_spans() if s.name == "batch.truncate"] == []
+
+
+# --- the bounds on what the events may carry ----------------------------------
+
+_CANARY = "CANARY-SHAPING-1298"
+
+
+def _everything_exported(exporter: Any) -> list[str]:
+    """Every string in every finished span: name, attributes, and each event's name and attributes."""
+    out: list[str] = []
+    for span in exporter.get_finished_spans():
+        out.append(span.name)
+        for key, value in (span.attributes or {}).items():
+            out += [key, str(value)]
+        for event in span.events:
+            out.append(event.name)
+            for key, value in (event.attributes or {}).items():
+                out += [key, str(value)]
+    return out
+
+
+def test_neither_payload_reaches_a_span_through_the_mutation_events(exporter: Any, upstream: Mock) -> None:
+    upstream.command_bus.send.return_value = {"text": _CANARY + "-result"}
+    pipeline = MutatorPipeline()
+    pipeline.register(_Mutator(rewrite={"text": _CANARY + "-rewritten"}))
+
+    result = BatchExecutor(mutator_pipeline=pipeline).execute(
+        batch_id="b-1298",
+        calls=[CallSpec(index=0, call_id="call-0", mcp_server="math", tool=_TOOL, arguments={"a": _CANARY})],
+        max_concurrency=1,
+        global_timeout=30.0,
+        fail_fast=False,
+    )
+
+    assert result.results[0].result == {"text": _CANARY + "-rewritten"}, "the canary went in"
+    assert [s for s in _everything_exported(exporter) if _CANARY in s] == []
+
+
+def test_neither_the_result_nor_the_continuation_id_reaches_the_truncate_span(
+    exporter: Any, small_truncation_budget: None, upstream: Mock
+) -> None:
+    upstream.command_bus.send.return_value = {"data": _CANARY + "y" * 600}
+
+    result = _run(BatchExecutor())
+
+    [call] = result.results
+    assert call.truncated and call.continuation_id, "the budget should have cut the result and stored the rest"
+    exported = _everything_exported(exporter)
+    assert [s for s in exported if _CANARY in s] == []
+    assert [s for s in exported if call.continuation_id in s] == []
+
+
+def test_a_direction_outside_the_two_records_no_mutation_event() -> None:
+    from mcp_hangar.observability.tracing import record_mutation
+
+    memory, tracer = _memory_tracer()
+    with tracer.start_as_current_span("op"):
+        record_mutation("sideways", True, 1.0)
+
+    [span] = memory.get_finished_spans()
+    assert _events(span, Shaping.MUTATION_EVENT) == []

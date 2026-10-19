@@ -31,8 +31,6 @@ References:
     - PRODUCT_ARCHITECTURE.md Section 2: "MCP-aware OTEL semantic conventions"
 """
 
-from typing import Any
-
 
 class McpServer:
     """Attributes describing an MCP mcp_server instance."""
@@ -186,6 +184,26 @@ class Gate:
     REFUSAL_REASON = "hangar.refusal.reason"
 
 
+class Route:
+    """Which backend served a call, and why (#1286, ADR-029 s5).
+
+    One selection per call, so these are attributes, not events. `mcp.server.id`
+    stays the target the caller named -- for a group, the group -- on every span
+    the executor opens for the call; the member a group selected is `BACKEND`.
+    """
+
+    #: The server the call was dispatched to: the selected member, or on a
+    #: standalone call the server itself. On `batch.call.<tool>`,
+    #: `mcp_server.cold_start` and each `command.send.InvokeToolCommand`.
+    #: Absent when no backend was chosen. Also on the `tool_invocation` audit
+    #: record, whose `mcp.server.id` is likewise the logical target (#1594).
+    BACKEND = "hangar.route.backend"
+    #: A `RouteReason` value, on `batch.call.<tool>`: `standalone`,
+    #: `load_balanced`, `pinned`, `canary`, `canary_fallback` or
+    #: `no_available_member`.
+    REASON = "hangar.route.reason"
+
+
 class Enforcement:
     """Attributes describing policy and enforcement decisions."""
 
@@ -211,6 +229,34 @@ class Enforcement:
 
     #: Severity level of a violation ("critical", "high", "medium", "low").
     VIOLATION_SEVERITY = "mcp.enforcement.violation_severity"
+
+
+class L7:
+    """The L7 egress policy verdict the aggregate applied to a call (#1295, ADR-029 s5).
+
+    Scalar attributes on `batch.call.<tool>`: the aggregate evaluates the policy
+    once per attempt and a refusal is never retried, so the last attempt's
+    verdict is the call's. An L7 verdict is not a gate: a `deny` or
+    `require_approval` sets `hangar.call.outcome=deny` and no
+    `hangar.refusal.*`, which name `_GATES` stages only. The policy's reasons,
+    argument values and header names or values are never exported.
+
+    A call refused because its arguments could not be inspected reads
+    `verdict=deny` with `hangar.call.outcome=error`, and in Enforce mode ends
+    `batch.call.<tool>` ERROR: the evaluator broke.
+    """
+
+    #: `allow`, `audit_observed`, `deny`, `require_approval` or `approval_honored`.
+    VERDICT = "hangar.l7.verdict"
+    #: The lowercased `PolicyMode`: `audit` or `enforce`.
+    MODE = "hangar.l7.mode"
+    #: The part of the policy the verdict rests on: `tool`, `argument` or
+    #: `header`. A verdict from the policy's default action reads `tool`: the
+    #: default is the tool ladder's last rung, and there is no fourth value.
+    RULE_KIND = "hangar.l7.rule_kind"
+    #: The policy's content hash, `sha256:` and hex digits (ADR-029 s6).
+    #: Omitted when it does not have that shape.
+    POLICY_ID = "hangar.l7.policy_id"
 
 
 class Audit:
@@ -342,14 +388,82 @@ class Retry:
     LAYER_HTTP = "http"
 
 
-class Shaping:
-    """Attributes describing how a call's payload was shaped (#1298).
+class EventDelivery:
+    """What happened to one domain event: its append and its handlers (#1280).
 
-    Request and response mutation and the per-call size limit are span EVENTS on
-    `batch.call.<tool>`, like `Retry`: one call can carry more than one of them.
-    Batch truncation can do cache I/O and gets its own short span. Only timing,
-    sizes and counts are recorded: never the arguments, the result, a cache entry
-    or a continuation id.
+    `event.publish.<Type>` stays one span per event, whatever the number of
+    handlers: `_deliver` also runs for every tailed and every recovered event,
+    so a span per handler would multiply the trace by the handler count. Each
+    handler's run is a span EVENT on it instead, which keeps one failing handler
+    among successful peers identifiable. Nothing from the event's payload is
+    recorded.
+    """
+
+    #: The event's `event_id`, on its `event.publish.<Type>` span.
+    EVENT_ID = "hangar.event.id"
+    #: The event's `produced_by`: the instance that produced it.
+    PRODUCER = "hangar.event.producer"
+    #: How the event reached this bus: `live`, `tailed` or `recovered`.
+    MODE = "hangar.event.delivery_mode"
+
+    #: Produced in this process and delivered as it was published.
+    LIVE = "live"
+    #: Read from the shared log, produced by a peer; projections only.
+    TAILED = "tailed"
+    #: Stored but never delivered by a previous run; delivered by the startup sweep.
+    RECOVERED = "recovered"
+
+    #: One handler's run, as an event on `event.publish.<Type>`.
+    HANDLED_EVENT = "hangar.event.handled"
+    #: The handler's `__qualname__`, bounded; never its arguments.
+    HANDLER_NAME = "hangar.event.handler.name"
+    #: The `HandlerKind` it subscribed with: `projection`, `effect` or `local_view`.
+    HANDLER_KIND = "hangar.event.handler.kind"
+    #: `success`, or `error` when the fault barrier caught it.
+    HANDLER_OUTCOME = "hangar.event.handler.outcome"
+
+    SUCCESS = "success"
+    ERROR = "error"
+
+    #: How `event_store.append` ended: `appended`; `conflict` when an explicit
+    #: expected version did not hold (raised to the caller); `failed` when the
+    #: store broke (the batch is delivered unpersisted after this span ends).
+    APPEND_OUTCOME = "hangar.event_store.append.outcome"
+
+    APPENDED = "appended"
+    CONFLICT = "conflict"
+    FAILED = "failed"
+
+
+class Shaping:
+    """How a call's payload was shaped on its way through (#1298).
+
+    ``hangar.shaping.*`` is stable surface, like every ``hangar.*`` namespace
+    (ADR-029 s9): its keys and values are added to, never renamed. Only timing,
+    sizes, counts and flags are recorded -- never the arguments, the result, a
+    cache entry or a continuation id (#1276, R1).
+
+    Signal choice, per ADR-029 s1:
+
+    - Request and response mutation are span EVENTS on `batch.call.<tool>`,
+      each carrying its duration. The rule reserves events for rare, instant
+      facts, and a mutation is neither quite: it fires on every call once
+      mutators are registered. It stays an event because there are at most two
+      per call -- request mutation runs once, before any retry, and response
+      mutation once, after the invoke that succeeded -- because a child span
+      would add two spans to every call for an in-process transform with no
+      I/O, and because the default empty pipeline records nothing at all. A
+      histogram was the other choice and was not taken: a metric cannot say
+      which call a slow mutation belonged to, and ADR-029 s1 keeps metrics for
+      aggregates and SLOs, which nobody has asked of mutation.
+    - Nothing here records a result over the size limit: it is no longer
+      dropped after it is held. The transport stops reading it and fails the
+      call with `ResponseTooLarge`, which the call span carries as its
+      `error.type` (#1613). The `hangar.shaping.drop` event #1606 added for
+      the drop went with it, before any release shipped it.
+    - Batch truncation is its own short `batch.truncate` span under
+      `batch.execute`: it runs once per batch and may write to the
+      continuation cache, which is I/O with a duration of its own.
     """
 
     #: One `MutatorPipeline` run that had mutators registered, as a span event.
@@ -357,22 +471,15 @@ class Shaping:
 
     #: Which payload was mutated: "request" (once, before any retry) or "response".
     DIRECTION = "hangar.shaping.direction"
+    REQUEST = "request"
+    RESPONSE = "response"
+    DIRECTIONS = frozenset({REQUEST, RESPONSE})
 
     #: Whether a mutator changed the payload, from `MutationResult.changed`.
     CHANGED = "hangar.shaping.changed"
 
     #: Milliseconds the mutator pipeline took.
     DURATION_MS = "hangar.shaping.duration_ms"
-
-    #: A result dropped by the per-call size limit, as a span event.
-    DROP_EVENT = "hangar.shaping.drop"
-
-    #: Why the result was dropped: "response_size_exceeded".
-    REASON = "hangar.shaping.reason"
-
-    #: Size of the dropped result in bytes, and the limit it exceeded.
-    SIZE_BYTES = "hangar.shaping.size_bytes"
-    LIMIT_BYTES = "hangar.shaping.limit_bytes"
 
     #: How many results batch truncation cut, on the `batch.truncate` span.
     TRUNCATED_COUNT = "hangar.shaping.truncated_count"
@@ -395,7 +502,9 @@ class Caller:
     #: Caller identifier (user ID, service account name, API key ID).
     ID = "mcp.caller.id"
 
-    #: Roles held by the caller at invocation time (comma-separated).
+    #: What authorized the call (comma-separated): the role its allow decision
+    #: matched, or ``opa_policy``. Written on audit records only, never on a
+    #: span (#1347, #1276).
     ROLES = "mcp.caller.roles"
 
     #: Tenant of the authenticated caller (``IdentityContext`` tenant_id).
@@ -433,114 +542,96 @@ class Health:
     DURATION_MS = "mcp.health.duration_ms"
 
 
-# ---------------------------------------------------------------------------
-# Convenience helpers
-# ---------------------------------------------------------------------------
+class HealthCheck:
+    """The outcome of one `mcp_server.health_check` span (#1296).
 
-
-def set_governance_attributes(  # noqa: C901 -- baseline CC=19; split before extending
-    span: Any,
-    *,
-    mcp_server_id: str,
-    tool_name: str,
-    mode: str | None = None,
-    group_id: str | None = None,
-    user_id: str | None = None,
-    session_id: str | None = None,
-    agent_id: str | None = None,
-    policy_result: str | None = None,
-    enforcement_action: str | None = None,
-    cold_start: bool | None = None,
-    caller_type: str | None = None,
-    caller_id: str | None = None,
-    caller_roles: str | None = None,
-    cost_cents: int | None = None,
-    cost_model: str | None = None,
-    cost_input_tokens: int | None = None,
-    cost_output_tokens: int | None = None,
-    cost_currency: str | None = None,
-    risk_score: float | None = None,
-    risk_session_anomaly_score: float | None = None,
-) -> None:
-    """Set standard MCP governance attributes on an OTEL span in one call.
-
-    Only attributes with non-None values are set. This avoids polluting
-    OTLP backends with empty string attributes for optional governance fields.
-
-    **Retained, with no caller in `src/`.** Its one caller was
-    `TracedMcpServerService`, the decorator ADR-029 retires and #1278 deleted.
-    The batch executor's own boundary sets the identity subset directly instead
-    of calling this, because this helper also asserts
-    `gen_ai.operation.name=execute_tool` and `mcp.method.name=tools/call`,
-    which name the upstream call: ADR-029 keeps those on the one CLIENT span
-    `execute_tool <tool>`, and repeating them on the governance span would
-    invite a GenAI-aware backend to count one invocation twice. The function
-    stays because it is public surface an ADR-007 adapter may call with its own
-    process-local invocation data, and removing it would break that without
-    giving anything back.
-
-    Args:
-        span: OpenTelemetry span (or any object with set_attribute method).
-        mcp_server_id: Required. McpServer identifier.
-        tool_name: Required. Tool name as advertised by the mcp_server.
-        mode: Optional. McpServer mode ("subprocess", "docker", "remote").
-        group_id: Optional. McpServer group identifier.
-        user_id: Optional. Human user identity.
-        session_id: Optional. MCP session identifier.
-        agent_id: Optional. Agent or client identifier.
-        policy_result: Optional. Policy evaluation result ("allow", "deny", "quarantine").
-        enforcement_action: Optional. Enforcement action taken.
-        cold_start: Optional. Whether this invocation triggered a cold start.
-        caller_type: Optional. Caller type ("human", "agent", "service", "anonymous").
-        caller_id: Optional. Caller identifier.
-        caller_roles: Optional. Comma-separated roles.
-        cost_cents: Optional. Cost in hundredths of a cent.
-        cost_model: Optional. Pricing model used.
-        cost_input_tokens: Optional. Input tokens consumed.
-        cost_output_tokens: Optional. Output tokens produced.
-        cost_currency: Optional. ISO 4217 currency code.
+    The span also carries `Health.CONSECUTIVE_FAILURES`. Kept apart from
+    `Health` because that class is the `mcp.*` namespace and this is `hangar.*`
+    (ADR-029 s9: new surface is additive, under `hangar.`).
     """
-    span.set_attribute(McpServer.ID, mcp_server_id)
-    span.set_attribute(GenAI.TOOL_NAME, tool_name)
-    span.set_attribute(GenAI.OPERATION_NAME, "execute_tool")
-    span.set_attribute(MCP.METHOD_NAME, "tools/call")
 
-    if mode is not None:
-        span.set_attribute(McpServer.MODE, mode)
-    if group_id is not None:
-        span.set_attribute(McpServer.GROUP_ID, group_id)
-    if user_id is not None:
-        span.set_attribute(MCP.USER_ID, user_id)
-    if session_id is not None:
-        span.set_attribute(MCP.SESSION_ID, session_id)
-    if agent_id is not None:
-        span.set_attribute(MCP.AGENT_ID, agent_id)
-    if policy_result is not None:
-        span.set_attribute(Enforcement.POLICY_RESULT, policy_result)
-    if enforcement_action is not None:
-        span.set_attribute(Enforcement.ACTION, enforcement_action)
-    if cold_start is not None:
-        span.set_attribute(MCP.COLD_START, str(cold_start).lower())
-    if caller_type is not None:
-        span.set_attribute(Caller.TYPE, caller_type)
-    if caller_id is not None:
-        span.set_attribute(Caller.ID, caller_id)
-    if caller_roles is not None:
-        span.set_attribute(Caller.ROLES, caller_roles)
-    if cost_cents is not None:
-        span.set_attribute(Cost.CENTS, cost_cents)
-    if cost_model is not None:
-        span.set_attribute(Cost.MODEL, cost_model)
-    if cost_input_tokens is not None:
-        span.set_attribute(GenAI.USAGE_INPUT_TOKENS, cost_input_tokens)
-    if cost_output_tokens is not None:
-        span.set_attribute(GenAI.USAGE_OUTPUT_TOKENS, cost_output_tokens)
-    if cost_currency is not None:
-        span.set_attribute(Cost.CURRENCY, cost_currency)
-    if risk_score is not None:
-        span.set_attribute(Risk.SCORE, risk_score)
-    if risk_session_anomaly_score is not None:
-        span.set_attribute(Risk.SESSION_ANOMALY_SCORE, risk_session_anomaly_score)
+    #: `healthy`, `unhealthy`, or `error` when the check itself raised.
+    OUTCOME = "hangar.health.outcome"
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+    ERROR = "error"
+
+
+class Saga:
+    """Attributes for saga runs and the commands a saga schedules (#1296, ADR-029).
+
+    One `saga.run` span covers one synchronous `start_saga`; each step and each
+    compensation is an event on it, because a saga has many steps and a scalar
+    would keep only the last. A timer-fired command opens `saga.scheduled_command`
+    in a new trace with one link to the span that scheduled it (ADR-029 s2).
+    """
+
+    #: The saga's `saga_type`, a class constant.
+    TYPE = "hangar.saga.type"
+    #: How the run ended: `completed`, `compensated` or `failed`.
+    OUTCOME = "hangar.saga.outcome"
+    COMPLETED = "completed"
+    COMPENSATED = "compensated"
+    FAILED = "failed"
+
+    #: One step's outcome, as an event on `saga.run`.
+    STEP_EVENT = "hangar.saga.step"
+    STEP_NAME = "hangar.saga.step.name"
+    #: `completed`, `no_action` (a step with no command), `failed`,
+    #: `compensated` or `compensation_failed`.
+    STEP_OUTCOME = "hangar.saga.step.outcome"
+    NO_ACTION = "no_action"
+    COMPENSATION_FAILED = "compensation_failed"
+
+    #: The command class a timer fired.
+    COMMAND = "hangar.saga.command"
+
+
+class TaskRelay:
+    """The outcome of one governed task follow-up span (#1281, ADR-029 s2, s8).
+
+    `tasks/get`, `tasks/cancel` and `tasks/update` each open one
+    `task_relay.<op>` span under the request's SDK SERVER span, with one link
+    to the `batch.call.<tool>` that created the task; Hangar's own cancel of a
+    task nobody was handed opens `task_relay.cancel_unhanded` in a new trace
+    linked the same way. The task id is never recorded: the link is the join.
+    """
+
+    #: How the follow-up ended; one of `OUTCOMES`, nothing else is exported.
+    OUTCOME = "hangar.task.outcome"
+    #: `tasks/get` answered with the upstream's current state.
+    SERVED = "served"
+    #: `tasks/get` answered with the stored snapshot, because the upstream answered an error.
+    UPSTREAM_ERROR = "upstream_error"
+    #: A cancel the upstream confirmed, or did not.
+    CONFIRMED = "confirmed"
+    UNCONFIRMED = "unconfirmed"
+    #: `tasks/update` reached the upstream and it accepted the input.
+    RELAYED = "relayed"
+    #: No task this caller owns has that id: unknown and foreign read the same, as on the wire.
+    NOT_FOUND = "not_found"
+    #: Refused on purpose: the capability ladder, tool access, withdrawal or digest drift.
+    REFUSED = "refused"
+    #: The follow-up itself failed.
+    ERROR = "error"
+    OUTCOMES = frozenset({SERVED, UPSTREAM_ERROR, CONFIRMED, UNCONFIRMED, RELAYED, NOT_FOUND, REFUSED, ERROR})
+
+
+class Discovery:
+    """Attributes for discovery's lease gate (#1296).
+
+    A follower skips every cycle. The skip is recorded as a
+    `discovery.lease_transition` span on the transitions only -- into the
+    follower role and back out of it -- never once per skipped cycle, and never
+    as a `discovery.cycle`, so it cannot be read as a failed one.
+    """
+
+    #: The role this instance just moved into: `follower` or `holder`.
+    LEASE_ROLE = "hangar.discovery.lease_role"
+    FOLLOWER = "follower"
+    HOLDER = "holder"
+    #: On the move back to `holder`: how many cycles were skipped as follower.
+    SKIPPED_CYCLES = "hangar.discovery.skipped_cycles"
 
 
 # legacy aliases

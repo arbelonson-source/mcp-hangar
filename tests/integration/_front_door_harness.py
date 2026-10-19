@@ -63,6 +63,13 @@ class Upstream(BaseHTTPRequestHandler):
     """A minimal JSON-answering MCP upstream that records the tools it is asked to call."""
 
     tools: ClassVar[tuple[str, ...]] = ()
+    #: Each tool's input properties. A property may declare ``x-mcp-header``
+    #: so its value is mirrored in, and validated against, an ``Mcp-Param-*``.
+    properties: ClassVar[dict[str, Any]] = {"x": {"type": "string"}}
+    #: A description for a tool named here; a tool not named here has none.
+    descriptions: ClassVar[dict[str, str]] = {}
+    #: More fields of a tool named here (``title``, ``annotations``, ``_meta``, ...).
+    extras: ClassVar[dict[str, dict[str, Any]]] = {}
     called: ClassVar[list[str]] = []
     #: A tool named here is answered only once its event is set, so a test can
     #: keep a call in flight. The call is recorded in `called` when it arrives.
@@ -84,7 +91,12 @@ class Upstream(BaseHTTPRequestHandler):
             if hold is not None:
                 hold.wait(timeout=30)
         definitions = [
-            {"name": name, "inputSchema": {"type": "object", "properties": {"x": {"type": "string"}}}}
+            {
+                "name": name,
+                **({"description": self.descriptions[name]} if name in self.descriptions else {}),
+                "inputSchema": {"type": "object", "properties": self.properties},
+                **self.extras.get(name, {}),
+            }
             for name in self.tools
         ]
         answer = {
@@ -99,6 +111,16 @@ class Upstream(BaseHTTPRequestHandler):
             "tools/call": {"result": {"content": [{"type": "text", "text": f"did {params.get('name')}"}]}},
         }.get(method, {"error": {"code": METHOD_NOT_FOUND, "message": f"Unknown method: {method}"}})
         self._send(200, json.dumps({"jsonrpc": "2.0", "id": request["id"], **answer}).encode())
+
+    def do_GET(self) -> None:  # noqa: N802 -- http.server's handler name
+        # No standing GET stream here, answered as a server without one does: 405.
+        # `BaseHTTPRequestHandler` answers 501, which the client retries with a
+        # backoff that reaches 8 and 16 s, and a closed client's stream thread
+        # sleeps it out after the test ends -- past the thread guard's grace.
+        self.send_response(405)
+        self.send_header("Allow", "POST")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _send(self, status: int, body: bytes) -> None:
         self.send_response(status)
@@ -132,9 +154,17 @@ class FrontDoor:
     upstream: type[Upstream]
 
     def post(
-        self, tenant: str, method: str, params: dict[str, Any], *, era: str = MODERN, request_id: int = 1
+        self,
+        tenant: str,
+        method: str,
+        params: dict[str, Any],
+        *,
+        era: str = MODERN,
+        request_id: int = 1,
+        extra_headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         headers = {
+            **(extra_headers or {}),
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
             "MCP-Protocol-Version": era,
@@ -166,9 +196,10 @@ class FrontDoor:
         *,
         era: str = MODERN,
         request_id: int = 1,
+        extra_headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         params = {"name": name, "arguments": arguments or {}}
-        return self.post(tenant, "tools/call", params, era=era, request_id=request_id)
+        return self.post(tenant, "tools/call", params, era=era, request_id=request_id, extra_headers=extra_headers)
 
     def error(self, tenant: str, name: str, *, era: str = MODERN) -> dict[str, Any]:
         payload = jsonrpc(self.call(tenant, name, era=era))
@@ -270,7 +301,11 @@ def front_door(
     for tenant, allowed in (policies or {}).items():
         resolver.set_standalone_member_policy(SERVER, tenant, ToolAccessPolicy(allow_list=allowed))
 
-    handler: type[Upstream] = type("_ThisUpstream", (upstream_class,), {"tools": tools, "called": [], "holds": {}})
+    handler: type[Upstream] = type(
+        "_ThisUpstream",
+        (upstream_class,),
+        {"tools": tools, "called": [], "holds": {}, "descriptions": {}, "extras": {}},
+    )
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
     runtime = None

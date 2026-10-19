@@ -20,6 +20,7 @@ for every adjacent pair that can be co-triggered. Written before splitting the
 function, so the split has something to be wrong against.
 """
 
+import time
 from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
@@ -94,6 +95,25 @@ def ctx():
         exec_groups.get.return_value = None
         val_groups.get.return_value = None
         yield context
+
+
+def _gates_start_late(*, index: int | None = None, delay: float = 0.05):
+    """Hold a call's worker before its first gate, so the collecting thread acts first (#1587).
+
+    With a spent budget (`global_timeout <= 0`) the collector's `as_completed`
+    times out at once and sets the batch's cancel event; held here, the call
+    meets its gates only after that. On a loaded runner that ordering happened
+    by chance and the call read "Cancelled before execution"; this makes it
+    happen every time.
+    """
+    run_gates = BatchExecutor._run_gates
+
+    def late(self, p):
+        if index is None or p.call.index == index:
+            time.sleep(delay)
+        return run_gates(self, p)
+
+    return patch.object(BatchExecutor, "_run_gates", late)
 
 
 def _run(*, global_timeout: float = 30.0) -> object:
@@ -359,3 +379,40 @@ class TestTheBudgetBeatsWhatComesAfterIt:
         assert "could not be verified" in result.error
         started = [type(call.args[0]).__name__ for call in ctx.command_bus.send.call_args_list]
         assert started == ["StartMcpServerCommand"]
+
+
+class TestASpentBudgetIsNotACancellation:
+    """A spent budget sets the batch's cancel event too; the call still reads as a timeout (#1587)."""
+
+    def test_a_call_that_starts_after_the_budget_ran_out_reads_batch_timeout(self, ctx):
+        _arrange_catalogue()
+        with _gates_start_late():
+            result = _run(global_timeout=-1.0)
+
+        assert (result.error_type, result.error) == ("TimeoutError", "Global timeout exceeded")
+
+    def test_an_explicit_cancellation_before_execution_still_reads_cancelled(self, ctx):
+        """The control: fail_fast cancels the second call while the budget has time left."""
+        _arrange_catalogue()
+        _arrange_tool_access_denied()
+        token = identity_context_var.set(_identity(_TENANT))
+        try:
+            with _gates_start_late(index=1):
+                batch = BatchExecutor().execute(
+                    batch_id="b",
+                    calls=[
+                        CallSpec(index=0, call_id="c-1", mcp_server=_SERVER, tool=_TOOL, arguments={}),
+                        CallSpec(index=1, call_id="c-2", mcp_server=_SERVER, tool="something-else", arguments={}),
+                    ],
+                    max_concurrency=2,
+                    global_timeout=30.0,
+                    fail_fast=True,
+                )
+        finally:
+            identity_context_var.reset(token)
+
+        assert batch.results[0].error_type == "ToolAccessDeniedError"
+        assert (batch.results[1].error_type, batch.results[1].error) == (
+            "CancellationError",
+            "Cancelled before execution",
+        )

@@ -52,7 +52,13 @@ CALLS: dict[str, list[tuple[str, str | None]]] = {
     # `auth` is `yaml` with API-key auth on (#1342): the app is wrapped in the
     # auth enforcement `serve --http` applies, and each call presents a key
     # minted in the bootstrapped store.
-    "auth": [("sampled", "01"), ("failed", "01")],
+    # `refused` names a tool the server's access policy denies (#1582).
+    # `unauthorized` is made with a second key, bound to a role without
+    # `tool:invoke`, so authorization refuses it before any gate (#1347).
+    "auth": [("sampled", "01"), ("failed", "01"), ("refused", "01"), ("unauthorized", "01")],
+    # `front_door` is `auth` served as a front door (#1622): each call is a flat
+    # `tools/call add`, by the `developer` key and by the `viewer` key.
+    "front_door": [("flat_served", "01"), ("flat_unauthorized", "01")],
     # `bound` is `yaml` with an identity the served HTTP path has no source for
     # -- a session, an agent and no user -- declared through the process-wide
     # fallback identity, the seam a stdio session's declared caller uses (ADR-026).
@@ -66,11 +72,22 @@ CALLS: dict[str, list[tuple[str, str | None]]] = {
 }
 
 #: call name -> (tool, arguments); every other call is add(1, 2).
-TOOLS: dict[str, tuple[str, dict[str, int]]] = {"failed": ("divide", {"a": 1, "b": 0})}
+TOOLS: dict[str, tuple[str, dict[str, int]]] = {
+    "failed": ("divide", {"a": 1, "b": 0}),
+    "refused": ("multiply", {"a": 1, "b": 2}),
+}
 
-#: The principal the ``auth`` mode's key authenticates as, and its tenant.
+#: The tool the ``auth`` mode's access policy denies.
+DENIED_TOOL = "multiply"
+
+#: The principal the ``auth`` mode's key authenticates as, its tenant, and its role.
 AUTH_PRINCIPAL = "user:audit-harness"
 AUTH_TENANT = "tenant-audit"
+AUTH_ROLE = "developer"
+
+#: The principal of the ``unauthorized`` call's key, and its role: one that may not invoke tools.
+VIEWER_PRINCIPAL = "user:audit-viewer"
+VIEWER_ROLE = "viewer"
 
 #: The identity the ``bound`` mode declares.
 BOUND_AGENT = "agent-audit"
@@ -125,11 +142,15 @@ def _hangar_call(client: Any, call: str, flags: str | None, headers: dict[str, s
     if flags is not None:
         meta["traceparent"] = f"00-{trace_id}-{span_id}-{flags}"
     tool, arguments = TOOLS.get(call, ("add", {"a": 1, "b": 2}))
+    flat = call.startswith("flat_")
     params = {
         "name": "hangar_call",
         "arguments": {"calls": [{"mcp_server": "math", "tool": tool, "arguments": arguments}]},
         "_meta": meta,
     }
+    if flat:  # the front door's flat call: the upstream tool by its own name
+        params = {"name": tool, "arguments": arguments, "_meta": meta}
+        headers = {**headers, "Mcp-Name": tool}
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params})
     response = client.post("/mcp", headers=headers, content=body)
     response.raise_for_status()
@@ -137,6 +158,8 @@ def _hangar_call(client: Any, call: str, flags: str | None, headers: dict[str, s
     if not text.startswith("{"):  # SSE framing: take the data line
         text = next(line[len("data: ") :] for line in text.splitlines() if line.startswith("data: "))
     result = json.loads(text)["result"]
+    if flat:
+        return {"trace_id": trace_id, "remote_span_id": span_id, "result": result}
     return {"trace_id": trace_id, "remote_span_id": span_id, "batch": json.loads(result["content"][0]["text"])}
 
 
@@ -145,11 +168,11 @@ def _resource(provider: Any) -> dict[str, Any]:
     return {k: v for k, v in dict(getattr(resource, "attributes", None) or {}).items() if isinstance(v, str)}
 
 
-def _authenticate(context: Any) -> dict[str, str]:
-    """Mint a key in the bootstrapped store, grant it tool calls, return its header."""
+def _authenticate(context: Any, principal: str = AUTH_PRINCIPAL, role: str = AUTH_ROLE) -> dict[str, str]:
+    """Mint a key for *principal* in the bootstrapped store, bind it to *role*, return its header."""
     auth = context.auth_components
-    key = auth.api_key_store.create_key(principal_id=AUTH_PRINCIPAL, name="audit-harness", tenant_id=AUTH_TENANT)
-    auth.role_store.assign_role(AUTH_PRINCIPAL, "developer")
+    key = auth.api_key_store.create_key(principal_id=principal, name=principal, tenant_id=AUTH_TENANT)
+    auth.role_store.assign_role(principal, role)
     return {"X-API-Key": key}
 
 
@@ -199,9 +222,12 @@ def main(mode: str, out: Path, endpoint: str) -> None:
     from mcp_hangar.server.bootstrap import bootstrap
     from mcp_hangar.server.lifecycle import mcp_app_for_serving
 
-    if mode in ("auth", "bound"):
+    if mode in ("auth", "bound", "front_door"):
         config["observability"] = {"tracing": {"otlp_endpoint": endpoint, "enabled": True}}
-    if mode == "auth":
+    if mode == "front_door":
+        config["tool_access"] = {"mode": "front_door"}
+    if mode in ("auth", "front_door"):
+        config["mcp_servers"]["math"]["tools"] = {"deny_list": [DENIED_TOOL]}
         config["auth"] = {
             "enabled": True,
             "allow_anonymous": False,
@@ -210,6 +236,10 @@ def main(mode: str, out: Path, endpoint: str) -> None:
         }
 
     context = bootstrap(config_dict=config)
+    if mode == "front_door":
+        from mcp_hangar.server.lifecycle import warm_the_front_door_catalogue
+
+        warm_the_front_door_catalogue(context.runtime)
 
     provider = get_logger_provider()
     logs = InMemoryLogs()
@@ -223,17 +253,22 @@ def main(mode: str, out: Path, endpoint: str) -> None:
     from starlette.testclient import TestClient
 
     headers = dict(HEADERS)
+    call_headers: dict[str, dict[str, str]] = {}
     app = mcp_app_for_serving(context.mcp_server)
-    if mode == "auth":
+    if mode in ("auth", "front_door"):
         from mcp_hangar.server.api.middleware import create_auth_enforced_app
 
         headers.update(_authenticate(context))
+        viewer = {**HEADERS, **_authenticate(context, VIEWER_PRINCIPAL, VIEWER_ROLE)}
+        call_headers["unauthorized"] = call_headers["flat_unauthorized"] = viewer
         app = create_auth_enforced_app(app, context.auth_components)  # what `run_http` wraps it in
     if mode == "bound":
         _declare_bound_identity()
 
     with TestClient(app, base_url=BASE_URL) as client:
-        calls = {name: _hangar_call(client, name, flags, headers) for name, flags in CALLS[mode]}
+        calls = {
+            name: _hangar_call(client, name, flags, call_headers.get(name, headers)) for name, flags in CALLS[mode]
+        }
 
     for server in context.runtime.repository.get_all().values():
         server.shutdown()
@@ -275,6 +310,10 @@ def main(mode: str, out: Path, endpoint: str) -> None:
                     }
                     for s in spans.get_finished_spans()
                 ],
+                # Every attribute key any span carried: caller roles must reach none (#1347).
+                "span_attribute_keys": sorted(
+                    {key for s in spans.get_finished_spans() for key in (s.attributes or {})}
+                ),
             }
         )
     )

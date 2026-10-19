@@ -841,6 +841,12 @@ class TestHangarStartsCoordinationAndTheWarmUp:
 
         assert order == ["keeper started", "tailer started", "tailer stopped", "keeper stopped"]
         assert hangar._context is None
+        # A start that raised leaves the facade's thread pool running, and only
+        # `stop()` releases it (see `Hangar.stop`). Without this the pool's
+        # worker outlived the test and was left to garbage collection; under
+        # pytest-xdist the unit thread guard ran before that and failed an
+        # unrelated test for it.
+        await hangar.stop()
 
     async def test_start_warms_the_front_door_and_stop_stops_the_retry(self):
         order: list[str] = []
@@ -1162,11 +1168,14 @@ class TestHangarWithMockedContext:
         assert result is True
 
     @pytest.mark.asyncio
-    async def test_start_mcp_server(self, hangar_with_context, mock_provider):
-        """Should start provider."""
+    async def test_start_mcp_server(self, hangar_with_context, mock_context, mock_provider):
+        """Starts through the command bus, as `hangar_start` does; `McpServer` has no `start` (#1685)."""
         await hangar_with_context.start_mcp_server("math")
 
-        mock_provider.start.assert_called_once()
+        (command,) = [c.args[0] for c in mock_context.runtime.command_bus.send.call_args_list]
+        assert type(command).__name__ == "StartMcpServerCommand"
+        assert command.mcp_server_id == "math"
+        assert command.deliberate is True
 
     @pytest.mark.asyncio
     async def test_stop_mcp_server(self, hangar_with_context, mock_provider):

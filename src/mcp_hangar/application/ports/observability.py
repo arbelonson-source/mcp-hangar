@@ -1,31 +1,18 @@
-"""Port for observability integrations (Langfuse, OpenTelemetry, etc.).
+"""Port for observability integrations.
 
 This module defines the interface for tracing tool invocations and recording
-metrics. Implementations adapt external observability platforms to this contract.
-
-Example usage:
-    observability = get_observability_adapter(config)
-    span = observability.start_tool_span("math", "add", {"a": 1, "b": 2})
-    try:
-        result = mcp_server.invoke(...)
-        span.end_success(result)
-    except Exception as e:  # noqa: BLE001 -- fault-barrier: docstring example
-        span.end_error(e)
+metrics. Since the Langfuse adapter was removed (#1683) only the Null adapter
+implements it and nothing calls it: Hangar's tool spans are OpenTelemetry's.
+``IAuditExporter`` below is wired and used.
 """
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
-
-#: Whether tool inputs and outputs are scrubbed before they reach an external
-#: observability backend when nobody said otherwise. Payload content leaves the
-#: process only on an explicit opt-in (#1276). This is the one stated default:
-#: every config that carries a scrub flag reads it from here, so two of them
-#: cannot drift apart again (#1534).
-SCRUB_PAYLOADS_BY_DEFAULT: bool = True
 
 
 @dataclass(frozen=True)
@@ -271,8 +258,19 @@ class IAuditExporter(Protocol):
         cost_input_tokens: int | None = None,
         cost_output_tokens: int | None = None,
         tenant_id: str | None = None,
+        refusal: Mapping[str, str] | None = None,
+        route_backend: str | None = None,
     ) -> None:
-        """Export a tool invocation event as an audit log record."""
+        """Export a tool invocation event as an audit log record.
+
+        *status* ``denied`` is a call Hangar refused (#1582); *refusal* then
+        holds its bounded ``hangar.gate.*`` or ``hangar.l7.*`` attributes.
+
+        *mcp_server_id* is the logical target the caller named -- the group,
+        for a group call -- and *route_backend* the server the call was routed
+        to, the member (#1594). A standalone call has the same value in both;
+        a refusal before a backend was chosen has no *route_backend*.
+        """
         ...
 
     def export_mcp_server_state_change(

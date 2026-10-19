@@ -10,15 +10,22 @@ Reference: ArcSight Common Event Format (CEF) Rev 25.
 This module is part of the compliance layer.
 """
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 
+from mcp_hangar import __version__
 from mcp_hangar.application.event_handlers.audit_handler import AuditRecord
+
+from .refusal import CALLER_ROLES, ROUTE_BACKEND, TOOL_INVOCATION_DENIED, refusal_wire_fields
 
 # CEF header constants
 CEF_VERSION = "0"
 DEVICE_VENDOR = "MCP Hangar"
 DEVICE_PRODUCT = "MCP Hangar"
-DEVICE_VERSION = "0.15.0"
+# The running release, not a literal: a literal stayed 0.15.0 from that
+# release on, and a SIEM correlating by device version was told every gateway
+# was a year old (#1705).
+DEVICE_VERSION = __version__
 
 # Map event types to CEF signature IDs and human-readable names.
 # Signature IDs follow a numbering scheme:
@@ -31,6 +38,7 @@ _SIGNATURE_MAP: dict[str, tuple[str, str]] = {
     "ToolInvocationRequested": ("100", "Tool Invocation Requested"),
     "ToolInvocationCompleted": ("101", "Tool Invocation Completed"),
     "ToolInvocationFailed": ("102", "Tool Invocation Failed"),
+    TOOL_INVOCATION_DENIED: ("103", "Tool Invocation Denied"),
     "ProviderStarted": ("200", "Provider Started"),
     "ProviderStopped": ("201", "Provider Stopped"),
     "ProviderStateChanged": ("202", "Provider State Changed"),
@@ -41,6 +49,8 @@ _SIGNATURE_MAP: dict[str, tuple[str, str]] = {
     "ProviderDiscovered": ("210", "Provider Discovered"),
     "ProviderRegistered": ("211", "Provider Registered"),
     "ProviderDeregistered": ("212", "Provider Deregistered"),
+    "ToolPinRecorded": ("410", "Tool Pin Recorded"),
+    "ToolPinRevoked": ("411", "Tool Pin Revoked"),
 }
 
 # Map event types to CEF severity (0-10 scale).
@@ -49,6 +59,8 @@ _SEVERITY_MAP: dict[str, int] = {
     "ToolInvocationRequested": 1,
     "ToolInvocationCompleted": 1,
     "ToolInvocationFailed": 7,
+    # Medium: a policy refusing a call is the gateway working, and still worth a look.
+    TOOL_INVOCATION_DENIED: 5,
     "ProviderStarted": 1,
     "ProviderStopped": 3,
     "ProviderStateChanged": 3,
@@ -59,6 +71,9 @@ _SEVERITY_MAP: dict[str, int] = {
     "ProviderDiscovered": 1,
     "ProviderRegistered": 1,
     "ProviderDeregistered": 3,
+    # A pin changing is a governance decision; a revoked one lifts a protection.
+    "ToolPinRecorded": 3,
+    "ToolPinRevoked": 5,
 }
 
 
@@ -105,6 +120,53 @@ def _format_cef_timestamp(dt: datetime) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return str(int(dt.timestamp() * 1000))
+
+
+def _caller_cost_extensions(data: Mapping[str, object]) -> list[str]:
+    """The caller and cost fields (#1705), in the dictionary's names where it has one.
+
+    The caller id is `suid`, the source user id; the type is the labelled
+    `flexString2`; the cost in hundredths of a cent and the input tokens are
+    `cn2` and `cn3`, the output tokens the labelled `flexNumber1`. Every
+    labelled string slot is taken (`cs1`-`cs6`, `flexString1`, `flexString2`),
+    so the pricing model has no CEF field and is carried by the other three
+    formats only. A zero cost is a value, not an absence.
+    """
+    extensions: list[str] = []
+    if data.get("caller_id"):
+        extensions.append(f"suid={_escape_extension_value(str(data['caller_id']))}")
+    if data.get("caller_type"):
+        extensions.append(f"flexString2={_escape_extension_value(str(data['caller_type']))}")
+        extensions.append("flexString2Label=CallerType")
+    for key, slot, label in (
+        ("cost_cents", "cn2", "CostCents"),
+        ("cost_input_tokens", "cn3", "CostInputTokens"),
+        ("cost_output_tokens", "flexNumber1", "CostOutputTokens"),
+    ):
+        if data.get(key) is not None:
+            extensions.append(f"{slot}={data[key]}")
+            extensions.append(f"{slot}Label={label}")
+    return extensions
+
+
+def _pin_extensions(event_type: str, data: Mapping[str, object]) -> list[str]:
+    """A tool pin's provenance (#1800): the pinned digest, the one it replaced, the approver.
+
+    `fileHash`/`oldFileHash` are the dictionary's fields for a hash and the hash
+    it replaced; the approver rides a labelled flex string.
+    """
+    if event_type not in ("ToolPinRecorded", "ToolPinRevoked"):
+        return []
+    out: list[str] = []
+    if data.get("sha256"):
+        out.append(f"fileHash={_escape_extension_value(str(data['sha256']))}")
+    if data.get("previous_sha256"):
+        out.append(f"oldFileHash={_escape_extension_value(str(data['previous_sha256']))}")
+    approver = data.get("approved_by") or data.get("revoked_by")
+    if approver:
+        out.append(f"flexString2={_escape_extension_value(str(approver))}")
+        out.append("flexString2Label=PinApprovedBy")
+    return out
 
 
 def format_audit_record(record: AuditRecord) -> str:
@@ -172,8 +234,23 @@ def format_audit_record(record: AuditRecord) -> str:
         extensions.append(f"cs6={_escape_extension_value(record.tenant_id)}")
         extensions.append("cs6Label=TenantID")
 
-    # Tool name from data (common in tool invocation events)
     data = record.data or {}
+    # What authorized the call (#1347) -> spriv, the dictionary's field for the
+    # privileges of the source user `suser` names.
+    caller_roles = data.get(CALLER_ROLES)
+    if caller_roles:
+        extensions.append(f"spriv={_escape_extension_value(str(caller_roles))}")
+    # The server a call was routed to -> flexString1 (#1594). cs1 is the target
+    # the caller named, the group for a group call, and cs1-cs6 are all taken,
+    # so the member goes in the dictionary's labelled flex string.
+    route_backend = data.get(ROUTE_BACKEND)
+    if route_backend:
+        extensions.append(f"flexString1={_escape_extension_value(str(route_backend))}")
+        extensions.append("flexString1Label=RouteBackend")
+
+    extensions.extend(_caller_cost_extensions(data))
+
+    # Tool name from data (common in tool invocation events)
     tool_name = data.get("tool_name")
     if tool_name:
         extensions.append(f"cs5={_escape_extension_value(str(tool_name))}")
@@ -189,6 +266,18 @@ def format_audit_record(record: AuditRecord) -> str:
     error_type = data.get("error_type")
     if error_type:
         extensions.append(f"reason={_escape_extension_value(str(error_type))}")
+
+    # A state change's transition (#1705). Every custom-string slot is taken,
+    # so it goes in `msg`, CEF's free-text message; without it two transitions
+    # of one server were byte-identical lines.
+    from_state, to_state = data.get("from_state"), data.get("to_state")
+    if from_state is not None and to_state is not None:
+        extensions.append(f"msg={_escape_extension_value(f'{from_state} -> {to_state}')}")
+
+    extensions.extend(_pin_extensions(event_type, data))
+
+    # A refused call's bounded gate or L7 fields (#1582).
+    extensions.extend(f"{key}={_escape_extension_value(value)}" for key, value in refusal_wire_fields(data))
 
     return header + "|" + " ".join(extensions)
 

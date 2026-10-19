@@ -14,6 +14,7 @@ from mcp_hangar._sdk_compat import FastMCP
 from ...application.commands import StartMcpServerCommand
 from ...application.mcp.tooling import mcp_tool_wrapper
 from ...application.queries import GetMcpServerQuery, GetMcpServerToolsQuery
+from ...application.read_models.tool_projection import get_tool_projection_registry
 from ...context import get_identity_context
 from ...domain.services import get_tool_access_resolver
 from ...metrics import TOOLS_FILTERED_TOTAL
@@ -70,6 +71,63 @@ def _caller_tenant_id() -> str | None:
 # =============================================================================
 
 
+def _owning_groups(server_id: str) -> tuple[str, ...]:
+    """The groups that own *server_id*, read where ``hangar_call`` reads them."""
+    from .batch.executor import owners_by_member
+
+    return owners_by_member().get(server_id, ())
+
+
+def _listed(tools: list[Any], *, named: str, served_by: str | None = None, tenant_id: str | None) -> list[dict]:
+    """Each listed tool as its wire dict, with its digest and any pin next to it (#1528).
+
+    Takes the list AFTER the tool-access filter: a tool this caller cannot list
+    gets no digest and no pin, because it is never passed here. A server with
+    predefined tools lists the schemas its configuration declares, so that is
+    what is digested there.
+
+    A tool that drifted from a blocking pin is left out (#1776): the call is
+    refused, and listing it would hand the model the drifted description.
+    ``hangar_details`` and REST show it to the operator, with the reason. A
+    tool under a blocking pin is served with only the fields the pin covers.
+    """
+    registry = get_tool_projection_registry()
+    # A server named directly is held to the pins of the groups that own it, as its call is.
+    groups = () if served_by else _owning_groups(named)
+    scopes = dict.fromkeys((named, served_by or named, *groups))
+    listed = []
+    for tool in tools:
+        entry = tool.to_dict()
+        fields = registry.digest_fields(entry, named=named, served_by=served_by, tenant_id=tenant_id, groups=groups)
+        if "withheld" in fields:
+            continue
+        entry = registry.served_definition(entry, tenant_id, scopes)
+        entry.update(fields)
+        listed.append(entry)
+    return listed
+
+
+def _withhold_drifted(mcp_server: str, tools: list[dict], tenant_id: str | None) -> list[dict]:
+    """Split the drifted tools out of *tools* for ``hangar_details``; return them withheld (#1776).
+
+    *tools* is the list already filtered by tool access, so a caller is told
+    about no tool it could not list (#905). A withheld entry carries its name,
+    the reason and the digests, never the drifted description. Each tool left
+    in *tools* under a blocking pin is cut down to the fields the pin covers.
+    """
+    registry = get_tool_projection_registry()
+    groups = _owning_groups(mcp_server)
+    withheld: list[dict] = []
+    for index, tool in reversed(list(enumerate(tools))):
+        fields = registry.digest_fields(tool, named=mcp_server, tenant_id=tenant_id, groups=groups)
+        if "withheld" in fields:
+            del tools[index]
+            withheld.insert(0, {"name": tool.get("name", ""), "reason": fields.pop("withheld"), **fields})
+        else:
+            tools[index] = registry.served_definition(tool, tenant_id, (mcp_server, *groups))
+    return withheld
+
+
 def _get_tools_for_group(mcp_server: str) -> dict[str, Any]:
     """Get tools for a mcp_server group."""
     ctx = get_context()
@@ -113,7 +171,9 @@ def _get_tools_for_group(mcp_server: str) -> dict[str, Any]:
     return {
         "mcp_server": mcp_server,
         "group": True,
-        "tools": [t.to_dict() for t in filtered_tools],
+        "tools": _listed(
+            filtered_tools, named=mcp_server, served_by=selected.mcp_server_id, tenant_id=_caller_tenant_id()
+        ),
     }
 
 
@@ -146,7 +206,7 @@ def _get_tools_for_mcp_server(mcp_server: str) -> dict[str, Any]:
             "mcp_server": mcp_server,
             "state": mcp_server_obj.state.value,
             "predefined": mcp_server_obj.tools_predefined,
-            "tools": [t.to_dict() for t in filtered_tools],
+            "tools": _listed(filtered_tools, named=mcp_server, tenant_id=tenant_id),
         }
 
     if mcp_server_obj.state.value == "dead":
@@ -178,7 +238,7 @@ def _get_tools_for_mcp_server(mcp_server: str) -> dict[str, Any]:
         "mcp_server": mcp_server,
         "state": mcp_server_obj.state.value,
         "predefined": False,
-        "tools": [t.to_dict() for t in filtered_tools],
+        "tools": _listed(filtered_tools, named=mcp_server, tenant_id=tenant_id),
     }
 
 
@@ -226,13 +286,20 @@ def register_mcp_server_tools(mcp: FastMCP) -> None:  # noqa: C901 -- baseline C
                 mcp_server: str,
                 state: str,
                 predefined: bool,
-                tools: [{name: str, description: str, inputSchema: object}]
+                tools: [{name: str, description: str, inputSchema: object,
+                         digest: str, pinned_digest?: str}]
             }
             Group: {
                 mcp_server: str,
                 group: true,
-                tools: [{name: str, description: str, inputSchema: object}]
+                tools: [{..., digest: str, pinned_digest?: str}]
             }
+            digest is the tool's SHA-256 schema fingerprint, as `mcp-hangar pin`
+            computes it. pinned_digest is the pin declared for your tenant (or
+            for all tenants) on this id, or on the group member that served the
+            listing; absent when none is. A tool that drifted from a pin in
+            block mode is not listed (hangar_details names it, with the
+            reason); under warn or audit it is listed and they differ.
             Error: ValueError with "unknown_mcp_server: <id>" or "no_healthy_members_in_group: <id>"
 
         Example:
@@ -280,15 +347,17 @@ def register_mcp_server_tools(mcp: FastMCP) -> None:  # noqa: C901 -- baseline C
 
         Returns:
             McpServer: {
-                mcp_server: str,
+                mcp_server_id: str,
                 state: str,
                 mode: str,
                 alive: bool,
                 tools: [{name, description, inputSchema}],
+                withheld_tools?: [{name, reason, digest, pinned_digest?}],
                 health: {consecutive_failures: int, last_check: str, ...},
                 idle_time: float,
                 meta: object,
-                dead: {reason, since, retry_allowed_at, revived_by} | null
+                dead: {reason, since, retry_allowed_at, revived_by} | null,
+                tools_policy: object
             }
             Group: {
                 group_id: str,
@@ -314,11 +383,15 @@ def register_mcp_server_tools(mcp: FastMCP) -> None:  # noqa: C901 -- baseline C
             revived_by is "call_or_start" (hangar_start, or a call after the
             backoff) or "start" (only hangar_start, for capability_blocked).
             Never upstream error text.
+            withheld_tools lists the tools left out of tools and hangar_tools
+            because they drifted from a pin in block mode (reason
+            "digest_drift"), without their description; absent when none is.
+            Re-pinning (`mcp-hangar pin --write`) returns them.
             Error: ValueError with "unknown_mcp_server: <id>"
 
         Example:
             hangar_details("math")
-            # {"mcp_server": "math", "state": "ready", "mode": "subprocess",
+            # {"mcp_server_id": "math", "state": "ready", "mode": "subprocess",
             #  "alive": true, "tools": [...], "health": {"consecutive_failures": 0},
             #  "idle_time": 12.5, "meta": {}}
 
@@ -349,11 +422,15 @@ def register_mcp_server_tools(mcp: FastMCP) -> None:  # noqa: C901 -- baseline C
 
         # Filter tools in the response if present (server→member merge for the caller tenant)
         if "tools" in result and result["tools"]:
+            tenant_id = _caller_tenant_id()
             original_count = len(result["tools"])
-            result["tools"] = resolver.filter_tool_dicts(mcp_server, result["tools"], member_id=_caller_tenant_id())
+            result["tools"] = resolver.filter_tool_dicts(mcp_server, result["tools"], member_id=tenant_id)
             filtered_count = original_count - len(result["tools"])
             if filtered_count > 0:
                 result["tools_policy"]["filtered_count"] = filtered_count
+            # After the access filter, so only a tool this caller may list is named (#905).
+            if withheld := _withhold_drifted(mcp_server, result["tools"], tenant_id):
+                result["withheld_tools"] = withheld
 
         return result
 

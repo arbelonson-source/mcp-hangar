@@ -11,6 +11,8 @@ all.
 question directly, so it answers it.
 """
 
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Annotated
 
@@ -18,7 +20,42 @@ import typer
 import yaml
 from rich.console import Console
 
+from ....domain.exceptions import ConfigurationError
+from ....pin_recheck import pin_recheck_interval_s
+from ....server.config import _max_consecutive_failures, build_config, check_process_config
 from ....server.config_schema import validate_config
+from ..config_path import DEFAULT_RULE_HELP, resolve_config_path
+
+
+def _value_problems(config: dict) -> list[str]:
+    """Values the boot refuses, found without booting (#1733).
+
+    `validate_config` reads key names only, so `pin_recheck_interval_s: 2` or
+    `max_consecutive_failures: 500` passed `config check` and then refused the
+    gateway. These run the checks the boot and a reload run: the process-wide
+    sections, then the `mcp_servers` section built the way a reload builds it,
+    which stages everything and puts nothing in force. A value the loader only
+    warns about and defaults is not a refusal and is not reported here.
+    """
+    problems: list[str] = []
+
+    def collect(check: Callable[[], object], *errors: type[Exception]) -> None:
+        try:
+            check()
+        except errors as exc:
+            if str(exc) not in problems:
+                problems.append(str(exc))
+
+    collect(lambda: pin_recheck_interval_s(config), ValueError)
+    collect(lambda: check_process_config(config), ConfigurationError, ValueError)
+    servers = config.get("mcp_servers")
+    if isinstance(servers, dict):
+        for server_id, spec in servers.items():
+            if isinstance(spec, dict) and spec.get("mode") != "group" and "max_consecutive_failures" in spec:
+                collect(partial(_max_consecutive_failures, str(server_id), spec), ConfigurationError)
+        collect(lambda: build_config(servers), ConfigurationError)
+    return problems
+
 
 app = typer.Typer(name="config", help="Inspect and validate configuration")
 
@@ -27,19 +64,19 @@ console = Console()
 
 @app.command(name="check")
 def check_command(
+    ctx: typer.Context,
     config_path: Annotated[
         Path,
-        typer.Argument(help="Path to config.yaml. Defaults to $MCP_CONFIG, else ./config.yaml."),
+        typer.Argument(help="Path to config.yaml. " + DEFAULT_RULE_HELP),
     ] = None,  # type: ignore[assignment]
 ) -> None:
-    """Report configuration keys that nothing reads.
+    """Report configuration keys that nothing reads and values the boot refuses.
 
-    Exit code 0 = every key is known, 1 = at least one is not, 2 = the file is
+    Exit code 0 = every key is known and every checked value is accepted, 1 = not, 2 = the file is
     missing or is not YAML.
     """
-    import os
-
-    path = Path(config_path or os.getenv("MCP_CONFIG") or "config.yaml")
+    # The positional path, then the global --config (#1682), then the shared default.
+    path = resolve_config_path(config_path, getattr(ctx.obj, "config", None)).path
 
     if not path.is_file():
         console.print(f"[red]No such configuration file:[/red] {path}")
@@ -56,16 +93,22 @@ def check_command(
         raise typer.Exit(2)
 
     problems = validate_config(config)
+    value_problems = _value_problems(config)
 
-    if not problems:
-        console.print(f"[green]OK[/green] {path}: every key is one Hangar reads.")
+    if not problems and not value_problems:
+        console.print(f"[green]OK[/green] {path}: every key is one Hangar reads and every checked value is accepted.")
         return
 
-    console.print(f"[red]FAIL[/red] {path}: {len(problems)} key(s) nothing reads:\n")
-    for problem in problems:
-        console.print(f"  {problem}")
-    console.print(
-        "\nA key Hangar does not read is kept and ignored, so the setting simply "
-        "does not apply. Check the spelling against the allowed set above."
-    )
+    if problems:
+        console.print(f"[red]FAIL[/red] {path}: {len(problems)} key(s) nothing reads:\n")
+        for problem in problems:
+            console.print(f"  {problem}")
+        console.print(
+            "\nA key Hangar does not read is kept and ignored, so the setting simply "
+            "does not apply. Check the spelling against the allowed set above."
+        )
+    if value_problems:
+        console.print(f"[red]FAIL[/red] {path}: {len(value_problems)} value(s) the gateway refuses at boot:\n")
+        for problem in value_problems:
+            console.print(f"  {problem}")
     raise typer.Exit(1)

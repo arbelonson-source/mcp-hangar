@@ -18,7 +18,10 @@ Proven: a ``hangar_call`` and a flat-tool call each produce a
 ``batch.call.<tool>`` span carrying the caller's tenant, id, type and user id;
 no identity attribute is exported as an empty string; and an attribute the
 identity context does not hold -- ``mcp.session.id``, for an API-key caller on
-this transport -- is absent rather than empty. Not proven: anything about
+this transport -- is absent rather than empty. Both gateways opt in with
+``MCP_TRACING_CALLER_IDS=true``: caller ids are off spans by default (#1580),
+which ``tests/integration/test_caller_ids_on_the_served_app.py`` proves over the
+served app on both entry points. Not proven: anything about
 anonymous callers or other transports, or the attributes of spans other than
 the enrichment boundary. Run with::
 
@@ -101,6 +104,7 @@ def _env(receiver: OtlpReceiver, run_id: str) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith(("OTEL_", "MCP_TRACING"))}
     env["OTEL_EXPORTER_OTLP_ENDPOINT"] = receiver.endpoint  # http:// -- plaintext gRPC
     env["OTEL_RESOURCE_ATTRIBUTES"] = f"service.instance.id={run_id}"
+    env["MCP_TRACING_CALLER_IDS"] = "true"  # the opt-in this tier exercises (#1580)
     return env
 
 
@@ -186,12 +190,14 @@ def _assert_identity(span: Received | None, where: str) -> None:
     empty = [key for key, value in attributes.items() if key.startswith(("mcp.caller.", "mcp.session")) and value == ""]
     assert not empty, f"{where}: exported empty identity attributes {empty}"
 
-    # This run found that an API-key caller over streamable-HTTP has no session
-    # id in its IdentityContext: the MCP session exists on the wire, and the
-    # identity bridges do not carry it. Asserted as observed, because the
-    # contract here is that an unknown value is OMITTED -- exporting an empty
-    # `mcp.session.id` would make every span claim a session it never had.
-    # Populating it is identity plumbing, not tracing, and is filed as #1539.
+    # An API-key caller over streamable-HTTP has no session id in its
+    # IdentityContext, and has no session to carry: the gateway serves HTTP
+    # stateless (#877), so the SDK creates and checks none, and a client's
+    # `Mcp-Session-Id` header is unverified -- copying it into identity would let
+    # a caller forge the id session suspension matches on (#1539). The contract
+    # is that an unknown value is OMITTED: an empty `mcp.session.id` would make
+    # every span claim a session it never had. A verified JWT `sid` is the source
+    # that does populate it.
     assert MCP.SESSION_ID not in attributes, (
         f"{where}: a session id is reaching the boundary now -- if the identity bridges were "
         f"taught to carry one, move MCP.SESSION_ID into _REQUIRED and delete this assertion"
@@ -222,3 +228,33 @@ def test_flat_tool_call_exports_the_callers_identity(harness: _Harness) -> None:
     assert not getattr(result, "is_error", False), result
 
     _assert_identity(_boundary_span(harness.receiver, harness.front_door.run_id), "flat tool")
+
+
+def test_hangar_calls_audit_record_names_the_authorizing_role(harness: _Harness) -> None:
+    """The role the key's decision matched reaches the audit record, and no span (#1347).
+
+    The span is the enrichment boundary with caller ids opted in: that opt-in
+    names ids, and roles stay on the audit record only (#1276, #1580).
+    """
+    result = _call(
+        harness.egress.base_url,
+        harness.api_key,
+        "hangar_call",
+        {"calls": [{"mcp_server": "math", "tool": _TOOL, "arguments": _ARGS}]},
+    )
+    assert not getattr(result, "is_error", False), result
+
+    def _record() -> Received | None:
+        for record in harness.receiver.logs(harness.egress.run_id):
+            if record.name == "tool_invocation" and record.attributes.get(MCP.TOOL_STATUS) == "success":
+                return record
+        return None
+
+    record = poll(_record, _ARRIVAL_TIMEOUT_S)
+    assert record is not None, "no tool_invocation audit record reached the receiver"
+    assert record.attributes.get(Caller.ROLES) == "developer", sorted(record.attributes.items())
+
+    span = _boundary_span(harness.receiver, harness.egress.run_id)
+    assert span is not None and Caller.ID in span.attributes, "the caller-id opt-in took effect"
+    carrying = [s.name for s in harness.receiver.spans(harness.egress.run_id) if Caller.ROLES in s.attributes]
+    assert not carrying, f"spans carried {Caller.ROLES}: {carrying}"

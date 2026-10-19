@@ -71,11 +71,26 @@ For metrics, open Prometheus at `http://localhost:9090` and query
 | `gen_ai.tool.name` | Tool name |
 | `mcp.tool.status` | `success` or `error` |
 | `mcp.tool.duration_ms` | Invocation duration |
-| `mcp.caller.type`, `mcp.caller.id`, `mcp.caller.roles` | The caller, when the call carries an identity (not in this example, which runs without authentication) |
+| `mcp.caller.type`, `mcp.caller.id`, `mcp.caller.roles` | The caller, when the call carries an identity (not in this example, which runs without authentication). `mcp.caller.id` also needs `MCP_TRACING_CALLER_IDS=true`: caller ids are off spans by default |
 
 The spans of a call, such as `batch.call.<tool>` and `policy.check_access`,
-carry `mcp.server.id` and `gen_ai.tool.name`. See
-`src/mcp_hangar/observability/conventions.py` for the full attribute taxonomy.
+carry `mcp.server.id` and `gen_ai.tool.name`. `batch.call.<tool>` also carries
+one `hangar.gate.decision` event per gate and the call's `hangar.call.outcome`;
+a refused call adds `hangar.refusal.gate` and `hangar.refusal.reason` and has no
+`execute_tool <tool>` CLIENT span. A server with an L7 egress policy adds the
+verdict it applied, `hangar.l7.verdict`, with `hangar.l7.mode`,
+`hangar.l7.rule_kind` and `hangar.l7.policy_id`; a verdict from the policy's
+default action reads `rule_kind=tool`. See
+`src/mcp_hangar/observability/conventions.py` for the attribute registry.
+
+## Diagnose a trace
+
+The [tracing diagnosis runbook](https://github.com/mcp-hangar/docs/blob/main/runbooks/tracing-diagnosis.md) finds one request in this
+Collector's output, explains a gate decision, tells sampling apart from dropped
+or missing export, and lists what is not traced yet. Its `jq` queries run
+against `telemetry.jsonl` from this example. How the endpoint, protocol, TLS,
+sampler and resource are resolved is in
+[OpenTelemetry integrations](https://github.com/mcp-hangar/docs/blob/main/observability/otel-integrations.md).
 
 ## Integrate with OpenLIT
 

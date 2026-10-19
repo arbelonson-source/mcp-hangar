@@ -43,6 +43,7 @@ from .analysis import (
     SessionUnsuspended,
 )
 from .approvals import (
+    ToolApprovalCancelled,
     ToolApprovalDenied,
     ToolApprovalExpired,
     ToolApprovalGranted,
@@ -110,6 +111,9 @@ from .enforcement import (
     ProviderCapabilityQuarantined,
     ProviderCapabilityQuarantineReleased,
     ResponseTruncated,
+    ToolAdmissionRequested,
+    ToolPinRecorded,
+    ToolPinRevoked,
 )
 from .health import (
     HealthCheckFailed,
@@ -120,6 +124,7 @@ from .interceptors import (
     InterceptorInvoked,
 )
 from .invocation import (
+    ToolCallRefused,
     ToolInvocationCompleted,
     ToolInvocationFailed,
     ToolInvocationRequested,
@@ -228,6 +233,9 @@ __all__ = [
     "CustomRoleUpdated",
     "DetectionRuleMatched",
     "DigestMismatchEvent",
+    "ToolPinRecorded",
+    "ToolPinRevoked",
+    "ToolAdmissionRequested",
     "DigestMismatchInTask",
     "DEGRADED_BY_HEALTH_CHECKS",
     "DELIBERATE_STOP_REASONS",
@@ -306,10 +314,12 @@ __all__ = [
     "TenantSuspended",
     "ToolAccessPolicyCleared",
     "ToolAccessPolicySet",
+    "ToolApprovalCancelled",
     "ToolApprovalDenied",
     "ToolApprovalExpired",
     "ToolApprovalGranted",
     "ToolApprovalRequested",
+    "ToolCallRefused",
     "ToolInvocationCompleted",
     "ToolInvocationFailed",
     "ToolInvocationRequested",

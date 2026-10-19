@@ -125,7 +125,7 @@ def register_hangar_tools(mcp: FastMCP) -> None:  # noqa: C901 -- baseline CC=18
         Returns:
             {
                 mcp_servers: [{
-                    mcp_server: str,
+                    mcp_server_id: str,
                     state: str,
                     mode: str,
                     alive: bool,
@@ -153,15 +153,16 @@ def register_hangar_tools(mcp: FastMCP) -> None:  # noqa: C901 -- baseline CC=18
 
         Example:
             hangar_list()
-            # {"mcp_servers": [{"mcp_server": "math", "state": "ready", "mode": "subprocess",
-            #   "alive": true, "tools_count": 2, "health_status": "healthy"}],
+            # {"mcp_servers": [{"mcp_server_id": "math", "state": "ready", "mode": "subprocess",
+            #   "alive": true, "tools_count": 2, "health_status": "healthy", "tools_predefined": false,
+            #   "dead": null}],
             #  "groups": [], "runtime_mcp_servers": []}
 
             hangar_list(state_filter="ready")
             # Returns only mcp_servers/groups in "ready" state
 
             hangar_list(state_filter="cold")
-            # {"mcp_servers": [{"mcp_server": "sqlite", "state": "cold", "alive": false}], ...}
+            # {"mcp_servers": [{"mcp_server_id": "sqlite", "state": "cold", "alive": false, ...}], ...}
         """
         return hangar_list(state_filter)
 
@@ -197,7 +198,7 @@ def register_hangar_tools(mcp: FastMCP) -> None:  # noqa: C901 -- baseline CC=18
                 members_in_rotation_count: int,
                 total_members: int
             }
-            Error: ValueError with "unknown_mcp_server: <id>" or "unknown_group: <id>"
+            Error: ValueError with "unknown_mcp_server: <id>" (an id that is neither a server nor a group)
 
         Example:
             hangar_start("math")
@@ -623,6 +624,23 @@ def _validate_mcp_server_name(name: str) -> None:
         raise ValueError("McpServer name too long (max 128 characters)")
 
 
+#: What `hangar_load` answers for an unverified server. It names the operator's
+#: decision and never the `force_unverified` argument: the reader is an agent,
+#: and the server it is loading wrote the text that brought it here.
+UNVERIFIED_INSTRUCTIONS = (
+    "Loading a server outside the trusted namespaces is the operator's decision, made in config.yaml: "
+    "list the server's namespace in `hot_loading.trusted_namespaces`, or set "
+    "`hot_loading.allow_force_unverified: true`. Ask the operator."
+)
+
+#: The same, for an entry in a trusted namespace that the registry no longer
+#: lists as active: no namespace can fix that.
+UNPUBLISHED_INSTRUCTIONS = (
+    "The registry no longer lists this server as active. Loading it anyway is the operator's decision, made in "
+    "config.yaml: set `hot_loading.allow_force_unverified: true`. Ask the operator."
+)
+
+
 def register_load_tools(mcp: FastMCP) -> None:
     """Register hot-loading tools with MCP server."""
 
@@ -653,7 +671,8 @@ def register_load_tools(mcp: FastMCP) -> None:
 
         Args:
             name: str - McpServer name from registry (e.g., "time", "stripe", "mcp-server-github")
-            force_unverified: bool - Allow loading unverified mcp_servers (default: false)
+            force_unverified: bool - Load a server outside the operator's trusted namespaces. Ignored
+                unless the operator set `hot_loading.allow_force_unverified: true` (default: false)
             allow_tools: list[str] | None - If set, only these tools are visible (glob patterns supported)
             deny_tools: list[str] | None - If set, these tools are hidden (glob patterns supported)
             approval_tools: list[str] | None - If set, these tools are visible but held for human
@@ -661,16 +680,19 @@ def register_load_tools(mcp: FastMCP) -> None:
                 has no approval gate, rather than loading tools that would run unapproved.
 
         Returns:
-            Success: {status: "loaded", mcp_server: str, tools: list[str]}
+            Success: {status: "loaded", message: str, mcp_server_id: str, mcp_server_name: str,
+                tools: [{name: str}], warnings?: list[str]}
+            Already loaded: {status: "already_loaded", message: str, mcp_server_id: str}
             Ambiguous: {status: "ambiguous", message: str, matches: list[str]}
             Not found: {status: "not_found", message: str}
-            Missing secrets: {status: "missing_secrets", mcp_server_name: str, missing: list[str], instructions: str}
+            Missing secrets: {status: "missing_secrets", mcp_server_name: str, missing: list[str],
+                message: str, instructions: str}
             Unverified: {status: "unverified", mcp_server_name: str, message: str, instructions: str}
             Not configured: {status: "failed", message: str}
 
         Example:
             hangar_load("time")
-            # {"status": "loaded", "mcp_server_id": "mcp-server-time", "tools": ["get_current_time"]}
+            # {"status": "loaded", "mcp_server_id": "mcp-server-time", "tools": [{"name": "get_current_time"}], ...}
 
             hangar_load("grafana", deny_tools=["delete_*", "create_alert_rule"])
             # {"status": "loaded", "mcp_server_id": "grafana", "tools": [...]} (filtered)
@@ -687,7 +709,8 @@ def register_load_tools(mcp: FastMCP) -> None:
             #  "instructions": "Set STRIPE_API_KEY environment variable"}
 
             hangar_load("untrusted-tool")
-            # {"status": "unverified", "instructions": "Use force_unverified=True to load"}
+            # {"status": "unverified", "instructions": "... the operator's decision ...
+            #  `hot_loading.trusted_namespaces` ... `hot_loading.allow_force_unverified`"}
         """
         ctx = get_context()
 
@@ -716,7 +739,7 @@ def register_load_tools(mcp: FastMCP) -> None:
                 "status": "unverified",
                 "mcp_server_name": e.mcp_server_name,
                 "message": str(e),
-                "instructions": "Use force_unverified=True to load unverified mcp_servers (security risk).",
+                "instructions": UNPUBLISHED_INSTRUCTIONS if e.trusted else UNVERIFIED_INSTRUCTIONS,
             }
 
         except MissingSecretsError as e:

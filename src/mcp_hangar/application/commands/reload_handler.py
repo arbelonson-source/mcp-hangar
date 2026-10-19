@@ -1,6 +1,7 @@
 """Command handler for configuration reload."""
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,9 +14,17 @@ from ...domain.services import get_tool_access_resolver
 from ...domain.services.tool_access_resolver import configured_topology_mode
 from ...logging_config import get_logger
 from ..ports.config_loader import IConfigLoader, PreparedServers
+from ..read_models.tool_projection import get_tool_projection_registry
+from ..services.pin_ledger import reconcile_pin_ledger
 from .commands import ReloadConfigurationCommand
 
 logger = get_logger(__name__)
+
+#: How long a graceful reload waits, in all, for the calls in flight to the servers it is about to stop.
+GRACEFUL_DRAIN_TIMEOUT_S = 30.0
+
+#: Waits until one server has no call in flight, for at most the given seconds; True once idle.
+DrainFn = Callable[[str, float], bool]
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,7 @@ class ReloadConfigurationHandler(CommandHandler):
         *,
         config_loader: IConfigLoader,
         groups: dict | None = None,
+        drain: DrainFn | None = None,
     ):
         """Initialize the handler.
 
@@ -82,12 +92,17 @@ class ReloadConfigurationHandler(CommandHandler):
                 production path were different ones.
             groups: The group registry. Not cleared by a reload any more: the
                 committed configuration replaces its entries (#1424).
+            drain: Waits for the calls in flight to one server. A graceful
+                reload calls it for every server it is about to stop, before it
+                stops any; a forced one does not. Without it a graceful reload
+                stops at once, which is what both modes did (#1662).
         """
         self._repository = mcp_server_repository
         self._event_bus = event_bus
         self._current_config_path = current_config_path
         self._config_loader = config_loader
         self._groups = groups if groups is not None else {}
+        self._drain = drain
 
     def handle(self, command: ReloadConfigurationCommand) -> dict[str, Any]:
         """Handle the reload configuration command.
@@ -120,6 +135,7 @@ class ReloadConfigurationHandler(CommandHandler):
 
         try:
             diff = self._reload(config_path, graceful=command.graceful)
+            self._record_pins()
         except ConfigurationError as e:
             # Already a domain error whose message was written to be shown to
             # the operator (e.g. "Failed to stop mcp_server '<id>' ..."). Let
@@ -260,7 +276,25 @@ class ReloadConfigurationHandler(CommandHandler):
         )
         return diff
 
+    def _drain_before_stop(self, current: dict[str, Any], mcp_server_ids: list[str]) -> None:
+        """Let the calls in flight to the servers about to stop finish, within one bounded wait."""
+        if self._drain is None:
+            return
+        deadline = time.monotonic() + GRACEFUL_DRAIN_TIMEOUT_S
+        for mcp_server_id in mcp_server_ids:
+            if mcp_server_id not in current:
+                continue
+            if not self._drain(mcp_server_id, max(0.0, deadline - time.monotonic())):
+                logger.warning(
+                    "reload_drain_timed_out",
+                    mcp_server_id=mcp_server_id,
+                    timeout_s=GRACEFUL_DRAIN_TIMEOUT_S,
+                    detail="stopping it with calls still in flight",
+                )
+
     def _stop(self, current: dict[str, Any], mcp_server_ids: list[str], *, graceful: bool) -> None:
+        if graceful:
+            self._drain_before_stop(current, mcp_server_ids)
         for mcp_server_id in mcp_server_ids:
             mcp_server = current.get(mcp_server_id)
             if not mcp_server:
@@ -285,6 +319,18 @@ class ReloadConfigurationHandler(CommandHandler):
             # the ones a runtime caller set.
             resolver.remove_mcp_server_policy(mcp_server_id)
             logger.info("mcp_server_removed", mcp_server_id=mcp_server_id)
+
+    def _record_pins(self) -> None:
+        """Record in the log the pins this reload added, changed or removed (#1800).
+
+        After the reload has applied, so it describes the pins now in force. A
+        ledger that cannot be written is logged and does not fail the reload,
+        which has already taken effect.
+        """
+        try:
+            reconcile_pin_ledger(get_tool_projection_registry(), self._event_bus)
+        except Exception:  # noqa: BLE001 -- fault-barrier: the reload has applied; the ledger is its record
+            logger.warning("pin_ledger_not_recorded", exc_info=True)
 
     def _report_failure(self, error: Exception, config_path: str, requested_by: str, start_time: float) -> None:
         duration_ms = (time.perf_counter() - start_time) * 1000

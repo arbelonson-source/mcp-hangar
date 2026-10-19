@@ -146,33 +146,16 @@ ROLE_PROVIDER_ADMIN = Role(
     description="Manage providers, deliver egress policy, and invoke tools",
     permissions=frozenset(
         [
-            # The REST API authorizes against the mcp_servers:* vocabulary; the
-            # provider:* entries below are the pre-rename names and are checked
-            # by nothing (see UNENFORCED_BY_DESIGN in
-            # tests/unit/test_permissions_defined_are_enforced.py). Without
-            # these two, this role cannot read a server or deliver a policy
-            # through the API at all, which is why the operator's API key has
-            # had to be `developer` or `admin`.
-            #
-            # policy:write is deliberately paired with mcp_servers:READ and not
-            # with mcp_servers:write: the operator only GETs servers and
-            # POST/DELETEs /l7_policy, so this is the whole set it needs.
-            # Granting write/lifecycle here would widen the role towards admin
-            # for a capability nothing asked for.
+            # The REST API and the tool-invoke path authorize against the
+            # mcp_servers:* vocabulary, so that is what this role holds. It
+            # carried the pre-rename provider:* entries too, which nothing
+            # checks, so it could read a server and push a policy but not
+            # register, start or stop one -- the opposite of its name.
             PERMISSION_PROVIDERS_READ,
+            PERMISSION_PROVIDERS_WRITE,
+            PERMISSION_PROVIDERS_LIFECYCLE,
             PERMISSION_POLICY_READ,
             PERMISSION_POLICY_WRITE,
-            PERMISSION_PROVIDER_CREATE,
-            PERMISSION_PROVIDER_READ,
-            PERMISSION_PROVIDER_UPDATE,
-            PERMISSION_PROVIDER_DELETE,
-            PERMISSION_PROVIDER_LIST,
-            PERMISSION_PROVIDER_START,
-            PERMISSION_PROVIDER_STOP,
-            PERMISSION_PROVIDER_LOAD,
-            PERMISSION_PROVIDER_LOAD_VERIFIED,
-            PERMISSION_PROVIDER_LOAD_ANY,
-            PERMISSION_PROVIDER_UNLOAD,
             PERMISSION_TOOL_INVOKE,
             PERMISSION_TOOL_LIST,
             PERMISSION_METRICS_READ,
@@ -186,6 +169,27 @@ ROLE_PROVIDER_ADMIN = Role(
             PERMISSION_DISCOVERY_APPROVE,
             PERMISSION_APPROVAL_READ,
             PERMISSION_APPROVAL_RESOLVE,
+        ]
+    ),
+)
+
+ROLE_KUBERNETES_OPERATOR = Role(
+    name="kubernetes-operator",
+    description="The Kubernetes operator's key: register, start and remove servers, deliver egress policy",
+    permissions=frozenset(
+        [
+            # Exactly what mcp-hangar-operator calls (0.17.26 and later): read a
+            # server, register it (POST /mcp_servers), start and stop it, remove
+            # it, and POST/DELETE its /l7_policy. Nothing else: no tool
+            # invocation, no groups, no discovery approval, no config reload, no
+            # admin. Pinned by tests/unit/test_kubernetes_operator_role.py, so an
+            # addition is a decision. Lifecycle is not scoped per server, so the
+            # role can also start a server it did not register (#1827).
+            PERMISSION_PROVIDERS_READ,
+            PERMISSION_PROVIDERS_WRITE,
+            PERMISSION_PROVIDERS_LIFECYCLE,
+            PERMISSION_POLICY_READ,
+            PERMISSION_POLICY_WRITE,
         ]
     ),
 )
@@ -262,6 +266,7 @@ ROLE_SERVICE_ACCOUNT = Role(
 BUILTIN_ROLES: dict[str, Role] = {
     "admin": ROLE_ADMIN,
     "provider-admin": ROLE_PROVIDER_ADMIN,
+    "kubernetes-operator": ROLE_KUBERNETES_OPERATOR,
     "developer": ROLE_DEVELOPER,
     "viewer": ROLE_VIEWER,
     "auditor": ROLE_AUDITOR,

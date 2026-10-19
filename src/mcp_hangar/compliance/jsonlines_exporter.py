@@ -1,23 +1,23 @@
 """JSON-lines audit exporter for compliance events."""
 
 import json
-import logging
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
 from mcp_hangar.application.event_handlers.audit_handler import AuditRecord
+from mcp_hangar.observability.health import ComplianceExportStatus
 
-logger = logging.getLogger(__name__)
-
-
-def _event_type_for_status(status: str) -> str:
-    if status in ("success", "completed"):
-        return "ToolInvocationCompleted"
-    if status in ("error", "failure", "failed"):
-        return "ToolInvocationFailed"
-    return "ToolInvocationRequested"
+from .file_output import FileOutput
+from .refusal import (
+    CALLER_ROLES,
+    REFUSAL_FIELDS,
+    ROUTE_BACKEND,
+    caller_cost_data,
+    event_type_for_status,
+    refusal_data,
+)
 
 
 def _record_to_json_line(record: AuditRecord) -> str:
@@ -26,16 +26,21 @@ def _record_to_json_line(record: AuditRecord) -> str:
         "timestamp": record.occurred_at.isoformat(),
         "event_type": record.event_type,
         "provider_id": record.provider_id,
+        ROUTE_BACKEND: data.get(ROUTE_BACKEND) or None,  # the member, for a group call (#1594)
         "tool_name": data.get("tool_name"),
         "status": data.get("status"),
         "duration_ms": data.get("duration_ms"),
         "user_id": record.caller_user_id,
+        CALLER_ROLES: data.get(CALLER_ROLES) or None,  # what authorized the call (#1347)
         "session_id": record.caller_session_id,
         "tenant_id": record.tenant_id or None,  # an empty tenant is no tenant
         "error_type": data.get("error_type"),
         "from_state": data.get("from_state"),
         "to_state": data.get("to_state"),
     }
+    payload.update({data_key: data.get(data_key) for _key, data_key, _wire in REFUSAL_FIELDS})
+    # The caller and cost fields (#1705); a zero cost is kept, only None is left out.
+    payload.update({key: value for key, _wire, value in caller_cost_data(data)})
     return json.dumps({key: value for key, value in payload.items() if value is not None})
 
 
@@ -48,17 +53,14 @@ class JSONLinesExporter:
     ) -> None:
         self._output_fn: Callable[[str], None] | None = output_fn
         self._output_path: Path | None = Path(output_path) if output_path else None
+        self._file: FileOutput | None = FileOutput(self._output_path, "jsonlines") if self._output_path else None
         self._lines_exported: int = 0
 
     def _emit(self, json_line: str) -> None:
         if self._output_fn is not None:
             _ = self._output_fn(json_line)
-        elif self._output_path is not None:
-            try:
-                with self._output_path.open("a", encoding="utf-8") as f:
-                    _ = f.write(json_line + "\n")
-            except OSError as e:
-                logger.error("Failed to write JSON-lines entry to %s: %s", self._output_path, e)
+        elif self._file is not None:
+            if not self._file.append(json_line):
                 return
         else:
             _ = sys.stderr.write(json_line + "\n")
@@ -82,6 +84,8 @@ class JSONLinesExporter:
         cost_input_tokens: int | None = None,
         cost_output_tokens: int | None = None,
         tenant_id: str | None = None,
+        refusal: Mapping[str, str] | None = None,
+        route_backend: str | None = None,
     ) -> None:
         data: dict[str, str | float | int] = {
             "tool_name": tool_name,
@@ -95,7 +99,7 @@ class JSONLinesExporter:
         if caller_id:
             data["caller_id"] = caller_id
         if caller_roles:
-            data["caller_roles"] = caller_roles
+            data[CALLER_ROLES] = caller_roles
         if cost_cents is not None:
             data["cost_cents"] = cost_cents
         if cost_model:
@@ -104,10 +108,13 @@ class JSONLinesExporter:
             data["cost_input_tokens"] = cost_input_tokens
         if cost_output_tokens is not None:
             data["cost_output_tokens"] = cost_output_tokens
+        data.update(refusal_data(refusal))
+        if route_backend:
+            data[ROUTE_BACKEND] = route_backend
 
         record = AuditRecord(
             event_id="",
-            event_type=_event_type_for_status(status),
+            event_type=event_type_for_status(status),
             occurred_at=datetime.now(UTC),
             mcp_server_id=mcp_server_id,
             data=data,
@@ -145,3 +152,8 @@ class JSONLinesExporter:
     @property
     def lines_exported(self) -> int:
         return self._lines_exported
+
+    @property
+    def export_status(self) -> ComplianceExportStatus | None:
+        """The file feed's write health; None when the output is not a file."""
+        return self._file.status if self._file is not None else None

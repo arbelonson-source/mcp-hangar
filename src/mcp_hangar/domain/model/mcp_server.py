@@ -2,6 +2,7 @@
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -13,6 +14,7 @@ if TYPE_CHECKING:
     from ..policies.egress_l7 import L7Policy
 
 from ...lock_hierarchy import LockLevel, TrackedLock
+from ..contracts.l7_verdict_observer import L7Verdict, L7VerdictKind, get_default_l7_verdict_observer
 from ..contracts.launcher import TransportClient
 from ..contracts.log_buffer import IMcpServerLogBuffer
 from ..contracts.metrics_publisher import IMetricsPublisher, get_default_metrics_publisher
@@ -40,12 +42,14 @@ from ..events import (
 from ..exceptions import (
     CannotStartMcpServerError,
     CapabilityBlockedError,
+    ClientError,
     EgressPolicyApprovalRequiredError,
     EgressPolicyDeniedError,
     InvalidStateTransitionError,
     McpServerNotHereError,
     McpServerNotReadyError,
     McpServerStartError,
+    ResponseTooLarge,
     ToolInvocationError,
     ToolNotFoundError,
 )
@@ -60,6 +64,9 @@ from .mcp_server_config import McpServerConfig
 from .tool_catalog import ToolCatalog, ToolSchema
 
 logger = get_logger(__name__)
+
+#: The health-check interval a server has when its config says nothing about it.
+_DEFAULT_HEALTH_CHECK_INTERVAL_S = 60
 
 
 # SUPPORTED_PROTOCOL_VERSION / HANGAR_CLIENT_INFO live in the leaf `protocol`
@@ -214,6 +221,52 @@ def _start_refusal(reason: str, time_left: float) -> str:
     return f"{START_REFUSED_IN_BACKOFF}, retry in {time_left:.1f}s"
 
 
+#: How many `tools/list` pages are followed before the rest is left unlisted (#1804).
+MAX_TOOLS_LIST_PAGES = 50
+
+
+def _list_all_tools(call_page: Callable[[dict[str, Any]], dict[str, Any]], mcp_server_id: str) -> dict[str, Any]:
+    """Run an upstream's `tools/list` to its last page and return it as one response (#1804).
+
+    `call_page(params)` makes one `tools/list` call. An upstream that paginates
+    returns a `nextCursor`; only the first page used to be read, so a tool on
+    page two was neither listed, nor pinned, nor checked for drift. The pages
+    are joined into the first response's `tools`, `nextCursor` removed. An
+    error on any page is returned as that page's response, so the caller fails
+    as it does for a failed single call. A repeated cursor, or more than
+    `MAX_TOOLS_LIST_PAGES` pages, ends the walk with a warning: a tool left
+    unlisted is not served, which is the safe side.
+    """
+    response = call_page({})
+    tools: list[Any] = []
+    seen: set[str] = set()
+    pages = 0
+    while True:
+        result = response.get("result")
+        if not isinstance(result, dict):
+            return response
+        tools.extend(result.get("tools") or [])
+        cursor = result.get("nextCursor")
+        pages += 1
+        if not isinstance(cursor, str) or not cursor:
+            break
+        if cursor in seen or pages >= MAX_TOOLS_LIST_PAGES:
+            logger.warning(
+                "tools_list_pagination_stopped",
+                mcp_server_id=mcp_server_id,
+                pages=pages,
+                reason="repeated_cursor" if cursor in seen else "page_limit",
+            )
+            break
+        seen.add(cursor)
+        response = call_page({"cursor": cursor})
+        if "result" not in response:
+            return response
+    joined: dict[str, Any] = dict(response)
+    joined["result"] = {k: v for k, v in response["result"].items() if k != "nextCursor"} | {"tools": tools}
+    return joined
+
+
 class McpServer(AggregateRoot):
     """
     McpServer aggregate root.
@@ -236,8 +289,13 @@ class McpServer(AggregateRoot):
         endpoint: str | None = None,
         env: dict[str, str] | None = None,
         idle_ttl_s: int | IdleTTL = 300,  # Accept both int and value object
-        health_check_interval_s: int | HealthCheckInterval = 60,  # Accept both int and value object
+        health_check_interval_s: int
+        | HealthCheckInterval
+        | None = None,  # None: not declared, 60 s and the worker's pace
         max_consecutive_failures: int = 3,
+        # This server's own read limit on one upstream response (#1613); None
+        # reads with the process-wide `execution.max_response_bytes`.
+        max_response_bytes: int | None = None,
         # Container-specific options
         volumes: list[str] | None = None,
         build: dict[str, str] | None = None,
@@ -269,6 +327,10 @@ class McpServer(AggregateRoot):
         # handler); off for config-file / directly-built servers so an
         # intentionally private endpoint is not newly refused at connect.
         enforce_ssrf: bool = False,
+        # The only names a subprocess server takes from the gateway's own
+        # environment; None inherits it as the launcher's filters allow. Set for
+        # a server loaded from the registry, whose author is not the operator.
+        inherit_env_names: frozenset[str] | None = None,
     ):
         super().__init__()
 
@@ -285,6 +347,8 @@ class McpServer(AggregateRoot):
         self._image = image
         self._endpoint = endpoint
         self._env = env or {}
+        self._inherit_env_names = None if inherit_env_names is None else frozenset(inherit_env_names)
+        self._max_response_bytes = max_response_bytes
 
         # Idle TTL - normalize to value object
         if isinstance(idle_ttl_s, IdleTTL):
@@ -293,10 +357,15 @@ class McpServer(AggregateRoot):
             self._idle_ttl = IdleTTL(idle_ttl_s)
 
         # Health check interval - normalize to value object
+        # Whether the config declared one. A server that did not is checked at the
+        # health-check worker's own pace; one that did is checked at its own (#1686).
+        self._health_check_interval_declared = health_check_interval_s is not None
         if isinstance(health_check_interval_s, HealthCheckInterval):
             self._health_check_interval = health_check_interval_s
         else:
-            self._health_check_interval = HealthCheckInterval(health_check_interval_s)
+            self._health_check_interval = HealthCheckInterval(
+                60 if health_check_interval_s is None else health_check_interval_s
+            )
 
         # Container-specific configuration
         self._volumes = volumes or []
@@ -505,6 +574,32 @@ class McpServer(AggregateRoot):
     def mcp_server_id(self) -> str:
         """McpServer identifier as string (for backward compatibility)."""
         return str(self._id)
+
+    def upstream_identity(self) -> str:
+        """What this server's upstream is, as a stable string a pin can be bound to (#1802).
+
+        The server's id is the operator's name for it and says nothing about what
+        answers behind it. This is derived from where the tools come from: the
+        origin of a remote endpoint (no credentials, path or query), the image of
+        a container, or the executable and a hash of the whole command line of a
+        subprocess (the hash keeps secrets in arguments out of config and logs).
+        A pin bound to it is not honoured by a server that points somewhere else.
+        """
+        if self._mode == McpServerMode.REMOTE:
+            from urllib.parse import urlsplit
+
+            parts = urlsplit(self._endpoint or "")
+            host = (parts.hostname or "").lower()
+            port = f":{parts.port}" if parts.port else ""
+            return f"remote:{parts.scheme.lower()}://{host}{port}"
+        if self._mode == McpServerMode.SUBPROCESS:
+            import hashlib
+            from pathlib import PurePath
+
+            argv = [str(part) for part in (self._command or [])]
+            digest = hashlib.sha256("\0".join(argv).encode("utf-8")).hexdigest()[:16]
+            return f"stdio:{PurePath(argv[0]).name if argv else ''}:{digest}"
+        return f"image:{self._image or ''}"
 
     @property
     def mode(self) -> McpServerMode:
@@ -953,6 +1048,9 @@ class McpServer(AggregateRoot):
             # carry this server's ID (HTTP clients are labeled at construction).
             if getattr(client, "mcp_server_id", "unset") is None:
                 client.mcp_server_id = str(self.mcp_server_id)
+            # Both transports read it for each response, so it applies from the handshake on.
+            if self._max_response_bytes is not None:
+                client.max_response_bytes = self._max_response_bytes
 
             # Start live stderr-reader thread if a log buffer is configured and the
             # client has a process with a stderr pipe (subprocess/docker/container modes).
@@ -1046,7 +1144,8 @@ class McpServer(AggregateRoot):
                         )
                     )
             except Exception:  # noqa: BLE001 -- fault-barrier: reader thread must not crash on pipe error
-                pass
+                # Say so: capture ends here, and it used to end without a trace (#1688).
+                logger.warning("stderr_reader_stopped", mcp_server_id=mcp_server_id, exc_info=True)
 
         t = threading.Thread(target=_reader, daemon=True, name=f"stderr-reader-{mcp_server_id}")
         t.start()
@@ -1061,9 +1160,23 @@ class McpServer(AggregateRoot):
         return {"mcp_server_id": self.mcp_server_id, "mcp_server_mode": self._mode.value}
 
     def _get_launch_config(self) -> dict[str, Any]:
-        """Get launch configuration for the current mode."""
+        """Get launch configuration for the current mode.
+
+        Raises:
+            ValueError: When `inherit_env_names` is set for a mode other than
+                subprocess. Only the subprocess launcher can honour it, and
+                ignoring it would launch with an environment nobody restricted.
+        """
+        if self._inherit_env_names is not None and self._mode != McpServerMode.SUBPROCESS:
+            raise ValueError(
+                f"inherit_env_names restricts a subprocess's inherited environment; mode {self._mode.value!r} "
+                "cannot honour it, so the server is not launched"
+            )
         if self._mode == McpServerMode.SUBPROCESS:
-            return {"command": self._command, "env": self._env, **self._span_labels()}
+            config: dict[str, Any] = {"command": self._command, "env": self._env, **self._span_labels()}
+            if self._inherit_env_names is not None:
+                config["inherit_only"] = self._inherit_env_names
+            return config
 
         if self._mode == McpServerMode.DOCKER:
             return {
@@ -1133,6 +1246,18 @@ class McpServer(AggregateRoot):
                 "Container mode requires 'image' or 'build.dockerfile'",
             )
         return self._image
+
+    @property
+    def declared_health_check_interval_s(self) -> int | None:
+        """Seconds between this server's health checks when they differ from the default, else None (#1686).
+
+        60 s is the default and is also what a config spells out to say "the
+        default" -- a reload treats the two as the same server -- so it does not
+        count as declaring one: such a server follows the health-check worker's
+        own pace, as every server did.
+        """
+        seconds = self._health_check_interval.seconds
+        return seconds if seconds != _DEFAULT_HEALTH_CHECK_INTERVAL_S else None
 
     def _is_session_terminated(self, response: Any) -> bool:
         """Did the upstream reject our transport session?
@@ -1268,7 +1393,7 @@ class McpServer(AggregateRoot):
             self._notify_initialized(client)
 
         # Discover tools
-        tools_resp = client.call("tools/list", {})
+        tools_resp = _list_all_tools(lambda params: client.call("tools/list", params), self.mcp_server_id)
         if "error" in tools_resp:
             error_msg = tools_resp["error"].get("message", "unknown")
             diagnostics = self._startup_diagnostics(client)
@@ -1671,6 +1796,7 @@ class McpServer(AggregateRoot):
             would_block = decision.action in (ToolAction.DENY, ToolAction.REQUIRE_APPROVAL)
             if would_block:
                 if self._l7_policy.mode is PolicyMode.AUDIT:
+                    self._observe_l7_verdict(decision, L7VerdictKind.AUDIT_OBSERVED)
                     self._record_event(
                         EgressPolicyViolationObserved(
                             mcp_server_id=self.mcp_server_id,
@@ -1692,9 +1818,11 @@ class McpServer(AggregateRoot):
                         would_be_action=decision.action.value,
                         reasons=list(decision.reasons),
                         policy_id=decision.policy_id,
+                        inspection_failed=decision.inspection_failed,
                     )
                     # Audit mode: fall through and proceed with the call.
                 elif decision.action is ToolAction.DENY:
+                    self._observe_l7_verdict(decision, L7VerdictKind.DENY)
                     self._record_egress_enforcement(decision, tool_name, correlation_id, identity_context_dict, "deny")
                     raise EgressPolicyDeniedError(
                         self.mcp_server_id, tool_name, "; ".join(decision.reasons), policy_id=decision.policy_id
@@ -1705,6 +1833,7 @@ class McpServer(AggregateRoot):
                     # authority here -- deny above still wins if the policy
                     # hardened during the hold; this branch only converts the
                     # require-approval verdict the approval was granted FOR.
+                    self._observe_l7_verdict(decision, L7VerdictKind.APPROVAL_HONORED)
                     logger.info(
                         "egress_policy_approval_honored",
                         mcp_server_id=self.mcp_server_id,
@@ -1712,10 +1841,13 @@ class McpServer(AggregateRoot):
                         approval_id=l7_approval_id,
                     )
                 else:  # ToolAction.REQUIRE_APPROVAL, nobody asked or nobody answered
+                    self._observe_l7_verdict(decision, L7VerdictKind.REQUIRE_APPROVAL)
                     self._record_egress_enforcement(
                         decision, tool_name, correlation_id, identity_context_dict, "require_approval"
                     )
                     raise EgressPolicyApprovalRequiredError(self.mcp_server_id, tool_name, policy_id=decision.policy_id)
+            else:
+                self._observe_l7_verdict(decision, L7VerdictKind.ALLOW)
 
     def _record_egress_enforcement(
         self,
@@ -1758,7 +1890,28 @@ class McpServer(AggregateRoot):
             reasons=list(decision.reasons),
             rule_kind=decision.rule_kind,
             policy_id=decision.policy_id,
+            inspection_failed=decision.inspection_failed,
         )
+
+    def _observe_l7_verdict(self, decision: Any, verdict: L7VerdictKind) -> None:
+        """Hand the verdict this call got to the observer port (#1295), once per call.
+
+        Built from the decision already made; nothing is evaluated again. A
+        telemetry failure must not change what the policy decided, so it is
+        swallowed here, before the branch that raises.
+        """
+        try:
+            get_default_l7_verdict_observer().observe(
+                L7Verdict(
+                    verdict=verdict,
+                    mode=self._l7_policy.mode.value if self._l7_policy is not None else "",
+                    rule_kind=decision.rule_kind,
+                    policy_id=decision.policy_id,
+                    inspection_failed=decision.inspection_failed,
+                )
+            )
+        except Exception:  # noqa: BLE001 -- fault-barrier: an observer must not change a policy verdict
+            pass
 
     def invoke_tool(  # noqa: C901 -- baseline CC=18 after the L7 split (#921); split further before extending
         self,
@@ -1767,6 +1920,7 @@ class McpServer(AggregateRoot):
         timeout: float = 30.0,
         l7_approval_id: str | None = None,
         progress_token: str | None = None,
+        logical_target: str = "",
     ) -> dict[str, Any]:
         """
         Invoke a tool on this mcp_server.
@@ -1784,6 +1938,10 @@ class McpServer(AggregateRoot):
             tool_name: Name of the tool to invoke
             arguments: Tool arguments
             timeout: Timeout in seconds
+            logical_target: What the caller named -- the group, for a call
+                dispatched to this server as a group's member (#1594). Stored
+                on ToolInvocationCompleted/Failed, which audit keys on; empty
+                when the caller named this server.
 
         Returns:
             Tool result dictionary
@@ -1846,8 +2004,10 @@ class McpServer(AggregateRoot):
                 raise ToolInvocationError(self.mcp_server_id, "mcp_server client is None")
 
             try:
-                refresh_result = refresh_client.call("tools/list", {}, timeout=5.0)
-            except (OSError, TimeoutError) as e:
+                refresh_result = _list_all_tools(
+                    lambda params: refresh_client.call("tools/list", params, timeout=5.0), self.mcp_server_id
+                )
+            except (OSError, TimeoutError, ClientError) as e:
                 refresh_error = e
                 logger.warning(f"tool_refresh_failed: {self.mcp_server_id}, error={e}")
 
@@ -1905,7 +2065,11 @@ class McpServer(AggregateRoot):
                 _tool_call_params(tool_name, arguments, progress_token),
                 timeout=timeout,
             )
-        except (OSError, TimeoutError) as e:
+        except ResponseTooLarge:
+            # A limit the gateway enforces, not a fault of the server: it keeps its
+            # own type for the caller and does not count against the server.
+            raise
+        except (OSError, TimeoutError, ClientError) as e:
             invocation_error = e
 
         # Lock cycle 3: Update state based on result
@@ -1923,6 +2087,7 @@ class McpServer(AggregateRoot):
                         error_message=str(invocation_error),
                         error_type=type(invocation_error).__name__,
                         identity_context=identity_context_dict,
+                        logical_target=logical_target,
                     )
                 )
 
@@ -1954,6 +2119,7 @@ class McpServer(AggregateRoot):
                         error_message=error_msg,
                         error_type=_rpc_error_type(response["error"]),
                         identity_context=identity_context_dict,
+                        logical_target=logical_target,
                     )
                 )
 
@@ -1974,8 +2140,9 @@ class McpServer(AggregateRoot):
             # A backend tool result with isError:true is a tool-level failure,
             # even though the JSON-RPC envelope carries no protocol error. Map it
             # to a failure here (the single authoritative point) so downstream
-            # health, batch counts, and events all reflect reality. The front
-            # door still re-surfaces the raw result verbatim to the caller.
+            # health, batch counts, and events all reflect reality. The raw result
+            # rides along in the error's details, and the executor hands it to the
+            # caller unchanged (#1900).
             if isinstance(result, dict) and result.get("isError"):
                 # Tool-level errors live in the content blocks (typically
                 # [{"type": "text", "text": ...}]), not the JSON-RPC error
@@ -1999,6 +2166,7 @@ class McpServer(AggregateRoot):
                         error_message=error_msg,
                         error_type="tool_error",
                         identity_context=identity_context_dict,
+                        logical_target=logical_target,
                     )
                 )
 
@@ -2010,6 +2178,9 @@ class McpServer(AggregateRoot):
                         "correlation_id": correlation_id,
                         "is_error": True,
                         "content": result.get("content"),
+                        # The whole answer, so a caller that is owed it unchanged
+                        # (`_meta` envelopes, `structuredContent`) can have it (#1900).
+                        "result": result,
                     },
                 )
 
@@ -2026,6 +2197,7 @@ class McpServer(AggregateRoot):
                     duration_ms=duration_ms,
                     result_size_bytes=len(str(result)),
                     identity_context=identity_context_dict,
+                    logical_target=logical_target,
                 )
             )
 
@@ -2088,7 +2260,9 @@ class McpServer(AggregateRoot):
         # Transport phase (outside lock): forward method + params verbatim.
         try:
             response = client.call(method, params, timeout=timeout)
-        except (OSError, TimeoutError) as e:
+        except ResponseTooLarge:
+            raise
+        except (OSError, TimeoutError, ClientError) as e:
             raise ToolInvocationError(
                 self.mcp_server_id,
                 str(e),
@@ -2117,6 +2291,47 @@ class McpServer(AggregateRoot):
                 error_type=bounded_error_type(type(exc).__qualname__),
             )
 
+    def recheck_catalogue(self) -> bool:
+        """Re-list a READY server's tools, and project them if they changed (#1693). Never starts it.
+
+        For the pin re-check worker: an upstream can change a tool without
+        sending ``tools/list_changed``, and the digest gate compares a pin with
+        the catalogue, not with the upstream. Copy the client under the lock,
+        list outside it, swap the catalogue under it only if the server is
+        still READY on that client -- the three phases ``health_check`` uses.
+        A listing that fails keeps the catalogue it had.
+
+        Returns:
+            Whether the catalogue changed and was announced.
+        """
+        with self._lock:
+            if self._state != McpServerState.READY or self._client is None:
+                return False
+            client = self._client
+        try:
+            response = _list_all_tools(
+                lambda params: self._call_with_session_recovery(client, "tools/list", params, timeout=5.0),
+                self.mcp_server_id,
+            )
+        except (OSError, TimeoutError, ClientError) as exc:
+            logger.warning(
+                "tool_catalogue_recheck_failed",
+                mcp_server_id=self.mcp_server_id,
+                error_type=bounded_error_type(type(exc).__qualname__),
+            )
+            return False
+        if "result" not in response:
+            return False
+        with self._lock:
+            if self._state != McpServerState.READY or self._client is not client:
+                return False
+            before = self._tools.to_dict()
+            self._tools.update_from_list(response.get("result", {}).get("tools", []))
+            changed = self._tools.to_dict() != before
+        if changed:
+            self._announce_catalogue()
+        return changed
+
     def _refresh_tools(self) -> bool:
         """Refresh tool catalog from mcp_server.
 
@@ -2134,12 +2349,16 @@ class McpServer(AggregateRoot):
             return False
 
         try:
-            tools_resp = self._client.call("tools/list", {}, timeout=5.0)
+            upstream = self._client
+            tools_resp = _list_all_tools(
+                lambda params: self._call_with_session_recovery(upstream, "tools/list", params, timeout=5.0),
+                self.mcp_server_id,
+            )
             if "result" in tools_resp:
                 tool_list = tools_resp.get("result", {}).get("tools", [])
                 self._tools.update_from_list(tool_list)
                 return True
-        except (OSError, TimeoutError) as e:
+        except (OSError, TimeoutError, ClientError) as e:
             logger.warning(f"tool_refresh_failed: {self.mcp_server_id}, error={e}")
         return False
 
@@ -2171,13 +2390,21 @@ class McpServer(AggregateRoot):
         response = None
 
         try:
-            response = client.call("tools/list", {}, timeout=5.0)
+            # Through the same recovery a call gets: after an upstream restart the
+            # probe hit the stale session, failed, and counted against the server
+            # until three failures degraded it and a restart reconnected it, minutes
+            # after the upstream was back (#1699).
+            response = self._call_with_session_recovery(client, "tools/list", {}, timeout=5.0)
             if "error" in response:
                 check_error = Exception(response["error"].get("message", "unknown"))
                 check_error_type = _rpc_error_type(response["error"])
-        except (OSError, TimeoutError) as e:
+        # A ClientError is a probe that got no answer: over HTTP, a refused
+        # connection is one (#1698). Caught here, it degrades the server like a
+        # timeout does; escaping, it left a stopped upstream READY for good.
+        except (OSError, TimeoutError, ClientError) as e:
             check_error = e
             check_error_type = bounded_error_type(type(e).__qualname__)
+        duration_ms = (time.time() - start_time) * 1000
 
         # Phase 3: Update state based on result under lock
         with self._lock:
@@ -2193,6 +2420,7 @@ class McpServer(AggregateRoot):
                         mcp_server_id=self.mcp_server_id,
                         consecutive_failures=self._health.consecutive_failures,
                         error_message=str(check_error),
+                        duration_ms=duration_ms,
                     )
                 )
 
@@ -2217,7 +2445,6 @@ class McpServer(AggregateRoot):
                 return False
 
             # Success
-            duration_ms = (time.time() - start_time) * 1000
             self._health.record_success()
 
             self._record_event(HealthCheckPassed(mcp_server_id=self.mcp_server_id, duration_ms=duration_ms))

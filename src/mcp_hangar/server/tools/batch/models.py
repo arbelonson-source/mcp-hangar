@@ -29,7 +29,6 @@ DEFAULT_PROVIDER_CONCURRENCY = 10
 DEFAULT_TIMEOUT = 60.0
 MAX_TIMEOUT = 300.0
 MAX_CALLS_PER_BATCH = 100
-MAX_RESPONSE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB per call
 MAX_TOTAL_RESPONSE_SIZE_BYTES = 50 * 1024 * 1024  # 50MB total
 
 DEFAULT_MAX_RETRIES = 3
@@ -51,14 +50,21 @@ class CallSpec:
     tool: str
     arguments: dict[str, Any]
     timeout: float | None = None
-    max_retries: int = 1  # Default: no retries (single attempt)
+    #: Total attempts the caller asked for; None = it did not say, and the configured `retry:` policy decides.
+    max_retries: int | None = None
     metadata: dict[str, str] | None = None  # W3C TraceContext headers (traceparent, tracestate)
     progress_token: str | None = None  # Minted upstream progress token (#883)
-    #: The caller takes the whole result: neither the per-call size cap nor the
+    #: The caller takes the whole result: no
     #: configured batch truncation cuts it, and no continuation is stored for
-    #: it. Set by the facade's ``invoke``, which returns results whole and has
-    #: no way to fetch a continuation (#1453).
+    #: it. Set by the facade's ``invoke`` (#1453) and the front door's flat
+    #: call (#1609): each returns its result whole, with no way to fetch a
+    #: continuation.
     whole_result: bool = False
+    #: What authorized this call (#1347), as ``_authorize_calls`` derived it
+    #: from the decision that admitted it: the matched role, or ``opa_policy``.
+    #: The worker sets it on a copy of the caller's identity, so the call's
+    #: audit record names it. Empty when auth is off or nothing decided.
+    caller_roles: tuple[str, ...] = ()
 
 
 @dataclass
@@ -103,6 +109,9 @@ class RelayCapture:
             back to the client verbatim once governed.
         logical_mcp_server: Logical mcp_server (or group) id the call targeted.
         tool: Tool name invoked on the call.
+        origin_traceparent: The ``batch.call.<tool>`` span's W3C ``traceparent``,
+            the origin the task's follow-ups link to (#1281); None when tracing
+            is off.
     """
 
     identity: IdentityContext | None
@@ -112,6 +121,7 @@ class RelayCapture:
     upstream: dict[str, Any]
     logical_mcp_server: str
     tool: str
+    origin_traceparent: str | None = None
 
 
 @dataclass
@@ -138,6 +148,14 @@ class CallResult:
     # What a failed invocation says about the group member that took it
     # (#1409). Set where the executor caught the error; None on every other path.
     member_outcome: MemberOutcome | None = None
+    # The aggregate refused the call because its L7 policy could not inspect the
+    # arguments (#1295): `hangar.call.outcome=error`, not `deny`.
+    l7_evaluator_failed: bool = False
+    # What the upstream answered when it reported its own failure (`isError: true`):
+    # the whole result, untouched, so its `_meta` envelopes (SEP-3313, SEP-2643),
+    # `structuredContent` and every content block reach the caller as sent (#1900).
+    # None for a failure Hangar raised itself and for every success.
+    upstream_result: dict[str, Any] | None = None
 
 
 @dataclass

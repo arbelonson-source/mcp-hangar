@@ -23,6 +23,7 @@ import anyio
 import pytest
 
 from mcp_hangar.context import (
+    PARAM_VALIDATED_HEADERS_ATTR,
     PARAM_VALIDATION_KEY,
     PARAM_VALIDATION_RAN,
     PARAM_VALIDATION_SKIPPED,
@@ -139,10 +140,24 @@ class TestTheSkipReachesTheEvaluator:
         finally:
             release_routing_headers(token)
 
-    def test_a_request_nothing_marked_is_carried_as_validated(self) -> None:
+    def test_a_request_nothing_marked_is_carried_as_unvalidated(self) -> None:
+        """Fail-closed (#1597): only a path that knows the SDK checked a header records it."""
         token = bind_routing_headers(_ctx())
         try:
-            assert routing_headers_var.get()[PARAM_VALIDATION_KEY] == PARAM_VALIDATION_RAN
+            bound = routing_headers_var.get()
+            assert bound[PARAM_VALIDATION_KEY] == PARAM_VALIDATION_SKIPPED
+            assert "mcp-param-region" not in bound
+        finally:
+            release_routing_headers(token)
+
+    def test_a_request_recorded_as_checked_is_carried_as_validated(self) -> None:
+        ctx = _ctx()
+        setattr(ctx.request.state, PARAM_VALIDATED_HEADERS_ATTR, frozenset({"mcp-param-region"}))
+        token = bind_routing_headers(ctx)
+        try:
+            bound = routing_headers_var.get()
+            assert bound[PARAM_VALIDATION_KEY] == PARAM_VALIDATION_RAN
+            assert bound["mcp-param-region"] == "eu-west-1"
         finally:
             release_routing_headers(token)
 
@@ -179,14 +194,36 @@ class TestTheGate:
         assert verdict is not None
         assert verdict[0] is ToolAction.DENY
 
-    def test_an_unstated_status_keeps_the_version_gate(self) -> None:
-        """The batch surface and stdio reach the evaluator with no request in hand."""
+    def test_an_unstated_status_is_not_a_match(self) -> None:
+        """Fail-closed (#1599): a mapping that does not say validation ran is not read as validated.
+
+        This used to pin the opposite: a mapping without the key kept only the
+        version gate, so a modern header matched on the strength of a status
+        nobody stated. No production writer omits the key today --
+        `bind_routing_headers` always sets it, and stdio and the embedded call
+        bind nothing -- but the evaluator must not depend on that. Only an
+        explicit ``ran`` (or ``partial``, which carries only checked headers)
+        admits a selector.
+        """
         without_status = {"mcp-param-region": "eu-west-1", "mcp-protocol-version": MODERN}
 
-        assert evaluate_headers(without_status, HeaderRules(deny=(EU,))) is not None
-        assert (
-            evaluate_headers({**without_status, "mcp-protocol-version": "2025-06-18"}, HeaderRules(deny=(EU,))) is None
-        )
+        assert evaluate_headers(without_status, HeaderRules(deny=(EU,))) is None
+        assert evaluate_headers(without_status, HeaderRules(allow=(EU,))) is None
+        assert evaluate_headers({**without_status, PARAM_VALIDATION_KEY: "unknown"}, HeaderRules(deny=(EU,))) is None
+
+    def test_an_unstated_status_says_the_rules_were_not_consulted(self) -> None:
+        policy = L7Policy(tools=ToolRules(allow=("*",)), headers=HeaderRules(deny=(EU,)))
+        without_status = {"mcp-param-region": "eu-west-1", "mcp-protocol-version": MODERN}
+
+        decision = evaluate("get_user", {}, policy, without_status)
+
+        assert decision.action is ToolAction.ALLOW
+        assert HEADER_RULES_NOT_CONSULTED in decision.reasons
+
+    def test_a_stated_run_still_keeps_the_version_gate(self) -> None:
+        legacy = {**_headers(), "mcp-protocol-version": "2025-06-18"}
+
+        assert evaluate_headers(legacy, HeaderRules(deny=(EU,))) is None
 
 
 class TestTheVerdict:

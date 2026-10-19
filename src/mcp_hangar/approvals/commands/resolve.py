@@ -43,6 +43,7 @@ from ...domain.contracts.authorization import GrantScope
 from ...domain.contracts.command import CommandHandler
 from ...domain.exceptions import MissingCredentialsError
 from ...domain.value_objects.security import Principal
+from ..models import ApprovalState
 
 #: Authorization tuple for resolving an approval. Matches
 #: ``PERMISSION_APPROVAL_RESOLVE`` in ``auth/roles.py`` -- the permission that
@@ -58,6 +59,8 @@ class ResolveOutcome(Enum):
     EXPIRED = "expired"
     NOT_FOUND = "not_found"
     ALREADY_TERMINAL = "already_terminal"
+    #: The held call was cancelled; an approval for it is refused (#1702).
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True)
@@ -172,6 +175,8 @@ class ResolveApprovalHandler(CommandHandler):
             # The caller's grant is held within a tenant this approval does not
             # name. Same answer as a foreign tenant: existence is scoped too.
             return ResolveApprovalResult(ResolveOutcome.NOT_FOUND)
+        if existing.state is ApprovalState.CANCELLED:
+            return ResolveApprovalResult(ResolveOutcome.CANCELLED, state=existing.state.value)
         if existing.is_terminal():
             return ResolveApprovalResult(ResolveOutcome.ALREADY_TERMINAL, state=existing.state.value)
         if existing.is_expired():
@@ -185,7 +190,19 @@ class ResolveApprovalHandler(CommandHandler):
             # that never ran, which is an audit trail asserting something
             # false. Mark it expired and refuse the decision.
             existing.expire()
-            await repository.update_state(command.approval_id, existing.state, None, existing.decided_at, None)
+            if not await repository.transition(
+                command.approval_id, (ApprovalState.PENDING,), existing.state, None, existing.decided_at, None
+            ):
+                # Decided, cancelled or expired by someone else since the read:
+                # report what now exists, not an expiry that did not happen (#1794).
+                current = await repository.get(command.approval_id)
+                if current is None:
+                    return ResolveApprovalResult(ResolveOutcome.NOT_FOUND)
+                if current.state is ApprovalState.CANCELLED:
+                    return ResolveApprovalResult(ResolveOutcome.CANCELLED, state=current.state.value)
+                if current.state is ApprovalState.EXPIRED:
+                    return ResolveApprovalResult(ResolveOutcome.EXPIRED, state=current.state.value)
+                return ResolveApprovalResult(ResolveOutcome.ALREADY_TERMINAL, state=current.state.value)
             return ResolveApprovalResult(ResolveOutcome.EXPIRED, state=existing.state.value)
 
         decided_by = str(command.principal.id)
@@ -193,10 +210,14 @@ class ResolveApprovalHandler(CommandHandler):
         if not success:
             # Another resolver can win between the preflight read and the
             # service's own read. Report the state that now exists rather than
-            # inventing a failure after a successful decision elsewhere.
+            # inventing a failure after a successful decision elsewhere. The
+            # service also refuses an approval for a held call whose batch was
+            # cancelled, and records it `cancelled`.
             updated = await repository.get(command.approval_id)
             if updated is None:
                 return ResolveApprovalResult(ResolveOutcome.NOT_FOUND)
+            if updated.state is ApprovalState.CANCELLED:
+                return ResolveApprovalResult(ResolveOutcome.CANCELLED, state=updated.state.value)
             return ResolveApprovalResult(ResolveOutcome.ALREADY_TERMINAL, state=updated.state.value)
 
         updated = await repository.get(command.approval_id)

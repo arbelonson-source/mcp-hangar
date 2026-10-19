@@ -31,7 +31,9 @@ from contextvars import ContextVar
 from typing import Any
 
 import structlog
+from mcp.shared.inbound import decode_header_value
 
+from mcp_hangar._sdk_compat import is_modern_protocol_version
 from mcp_hangar.domain.value_objects.identity import IdentityContext
 
 # Context variables for request-scoped data
@@ -72,6 +74,11 @@ caller_polls_tasks_var: ContextVar[bool] = ContextVar("caller_polls_tasks", defa
 #: channel the projection memo already uses (#1049).
 PARAM_VALIDATION_STATE_ATTR = "hangar_param_validation_skipped"
 
+#: Where the front door records the ``Mcp-Param-*`` headers of this POST known
+#: to agree with its body, lower-cased. Per-POST like the skip above, so every
+#: bind of this request reads the same answer. Absent means none (#1597).
+PARAM_VALIDATED_HEADERS_ATTR = "hangar_param_validated_headers"
+
 #: The entry :func:`bind_routing_headers` adds to the mapping to carry the skip
 #: status to the evaluator. Not an HTTP header: an ``MCPEgressPolicy`` selector
 #: can only name an ``Mcp-Param-*`` header (``egress_l7._header_matches``
@@ -79,9 +86,23 @@ PARAM_VALIDATION_STATE_ATTR = "hangar_param_validation_skipped"
 #: a client sending it by that name is filtered out below.
 PARAM_VALIDATION_KEY = "hangar-param-validation"
 
-#: Values of :data:`PARAM_VALIDATION_KEY`.
+#: Values of :data:`PARAM_VALIDATION_KEY`: none, some (#1599) or all carried ``Mcp-Param-*`` headers dropped.
 PARAM_VALIDATION_RAN = "ran"
+PARAM_VALIDATION_PARTIAL = "partial"
 PARAM_VALIDATION_SKIPPED = "skipped"
+
+#: The header a request states its revision in, read rather than negotiated: ``_meta``
+#: defaults to the modern version when absent, which would make a handshake-era request look modern.
+PROTOCOL_VERSION_HEADER = "mcp-protocol-version"
+
+
+def predates_param_validation(headers: Mapping[str, str]) -> bool:
+    """Whether a request's revision predates mandatory ``Mcp-Param-*`` validation (ADR-025 Decision 2).
+
+    The one reading shared by the L7 evaluator and ``headers.param_validation.required``,
+    so the two cannot disagree. An absent version is handshake-era.
+    """
+    return not is_modern_protocol_version(headers.get(PROTOCOL_VERSION_HEADER))
 
 
 def select_routing_headers(headers: Mapping[str, str] | None) -> Mapping[str, str]:
@@ -113,25 +134,61 @@ def bind_routing_headers(request_context: Any) -> Any:
     exposing one as ``.request_context`` -- so the front door and the batch
     surface share one definition instead of growing one each.
 
-    The mapping also carries whether this request's ``Mcp-Param-*`` headers were
-    validated against the body, read off ``request.state`` where the listing
-    path left it (ADR-025). Absent state means the ladder ran, which is what a
-    request that reaches a handler at all has done unless something recorded
-    otherwise.
+    Only the ``Mcp-Param-*`` headers recorded under
+    :data:`PARAM_VALIDATED_HEADERS_ATTR` are bound. The SDK checks only the
+    called tool's declared ones, and a selector must not match any other
+    (ADR-025). Nothing recorded, or a recorded skip, binds none: fail-closed
+    (#1597). A bound value is the one the SDK validated, sentinel-decoded
+    (#1600). :data:`PARAM_VALIDATION_KEY` reads ``skipped`` when headers were
+    carried and none survived, ``partial`` when only some did (#1599).
 
     Returns a token to reset, or ``None``. Fully fault-barriered.
     """
     try:
-        inner = getattr(request_context, "request_context", None) or request_context
-        request = getattr(inner, "request", None)
-        selected = dict(select_routing_headers(getattr(request, "headers", None)))
-        if not selected:
-            return None
-        skipped = bool(getattr(getattr(request, "state", None), PARAM_VALIDATION_STATE_ATTR, False))
-        selected[PARAM_VALIDATION_KEY] = PARAM_VALIDATION_SKIPPED if skipped else PARAM_VALIDATION_RAN
-        return routing_headers_var.set(selected)
+        bound = _selectable_headers(request_context)
+        return None if bound is None else routing_headers_var.set(bound)
     except Exception:  # noqa: BLE001 -- header bags vary; a missed bind must never break a call
         return None
+
+
+def param_headers_unchecked(request_context: Any) -> bool:
+    """Whether this request carried an ``Mcp-Param-*`` header no selector will see (#1599).
+
+    A handshake-era request never had its headers checked, by design: that is an
+    era rather than a failure, so its headers are ignored rather than refused (#1605).
+    Fail-closed: a request whose headers cannot be read counts as unchecked.
+    """
+    try:
+        bound = _selectable_headers(request_context)
+    except Exception:  # noqa: BLE001 -- an unreadable request is not a checked one
+        return True
+    return (
+        bound is not None
+        and bound[PARAM_VALIDATION_KEY] != PARAM_VALIDATION_RAN
+        and not predates_param_validation(bound)
+    )
+
+
+def _selectable_headers(request_context: Any) -> dict[str, str] | None:
+    """The mapping :func:`bind_routing_headers` binds, or ``None`` when there is none."""
+    inner = getattr(request_context, "request_context", None) or request_context
+    request = getattr(inner, "request", None)
+    selected = dict(select_routing_headers(getattr(request, "headers", None)))
+    if not selected:
+        return None
+    state = getattr(request, "state", None)
+    skipped = bool(getattr(state, PARAM_VALIDATION_STATE_ATTR, False))
+    keep = set() if skipped else {name.lower() for name in getattr(state, PARAM_VALIDATED_HEADERS_ATTR, ())}
+    bound = {k: v for k, v in selected.items() if not k.startswith("mcp-param-")}
+    # Bound as the SDK compared it with the body: sentinel-decoded by its own helper (#1600).
+    # A sentinel that does not decode never matched the body, so it is dropped as unchecked.
+    for name in keep & {k for k in selected if k.startswith("mcp-param-")}:
+        if (value := decode_header_value(selected[name])) is not None:
+            bound[name] = value
+    kept = any(k.startswith("mcp-param-") for k in bound)
+    status = PARAM_VALIDATION_PARTIAL if kept else PARAM_VALIDATION_SKIPPED
+    bound[PARAM_VALIDATION_KEY] = PARAM_VALIDATION_RAN if len(bound) == len(selected) else status
+    return bound
 
 
 def release_routing_headers(token: Any) -> None:

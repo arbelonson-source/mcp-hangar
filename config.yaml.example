@@ -16,6 +16,12 @@
 execution:
   max_concurrency: 50                # Global limit across all providers (default: 50)
   default_provider_concurrency: 10   # Default per-provider limit (default: 10)
+  # The most bytes of one upstream response Hangar reads, over stdio or HTTP
+  # (default: 33554432, 32 MiB). Enforced while the response is read: past it
+  # the read stops and the call fails with ResponseTooLarge. The
+  # MCP_MAX_RESPONSE_BYTES env var wins over this key, and a server's own
+  # `max_response_bytes` (see `math` below) wins over both.
+  # max_response_bytes: 33554432
 
 # ---------------------------------------------------------------------------
 # Interceptors — opt-in built-in request validators (OFF by default)
@@ -49,6 +55,8 @@ mcp_servers:
     command: [python, -m, examples.provider_math.server]
     idle_ttl_s: 180
     # max_concurrency: 10   # Per-provider limit (inherits default_provider_concurrency)
+    # max_response_bytes: 8388608   # This server's own response read limit
+    #                               # (inherits execution.max_response_bytes)
     #
     # `tools:` is OVERLOADED — it accepts two distinct forms:
     #
@@ -211,17 +219,15 @@ mcp_servers:
 #   rps: 10      # tokens (requests) added per second
 #   burst: 20    # maximum burst capacity (bucket size)
 
-# Observability - Langfuse integration (optional)
-# Provides end-to-end tracing for MCP tool invocations
+# Observability - OpenTelemetry tracing (optional)
+# Provides end-to-end tracing for MCP tool invocations. To send the spans to
+# Langfuse, point OTEL_EXPORTER_OTLP_TRACES_ENDPOINT at its OTLP endpoint: see
+# examples/langfuse/README.md. There is no `langfuse:` block any more (#1683).
 # observability:
-#   langfuse:
-#     enabled: true
-#     public_key: ${LANGFUSE_PUBLIC_KEY}   # From Langfuse dashboard
-#     secret_key: ${LANGFUSE_SECRET_KEY}   # From Langfuse dashboard
-#     host: https://cloud.langfuse.com    # Or self-hosted URL
-#     sample_rate: 1.0                    # 0.0-1.0, fraction of traces to sample
-#     scrub_inputs: false                 # Redact sensitive input data
-#     scrub_outputs: false                # Redact sensitive output data
+#   tracing:
+#     caller_ids: false   # Put caller user, agent and session ids on spans.
+#                         # Off by default; MCP_TRACING_CALLER_IDS wins over this.
+#                         # Tenant, principal type and correlation id are always on.
 
 # Storage backend (optional) -- ONE decision for everything the gateway persists
 #
@@ -313,3 +319,48 @@ logging:
 #
 # resource_links:
 #   max_per_tenant: 4096
+
+# ---------------------------------------------------------------------------
+# Hot-loading — what a server loaded from the registry may have
+# ---------------------------------------------------------------------------
+# `hangar_load` installs and starts a server from the MCP registry at runtime.
+# Its registry entry is written by whoever published it, so nothing in it is
+# trusted: the keys below are the operator's decisions, and each defaults to
+# refusing. They are applied at startup and on every reload, and each load
+# reads the ones in force.
+#
+# trusted_namespaces: the source of "verified". An entry is verified when its
+#   exact registry name starts with a listed namespace and the registry lists
+#   it as active. Matching is case-sensitive and by whole segment: every
+#   namespace ends in `/` (one is added when it is left out), so
+#   "io.github.acme/" matches "io.github.acme/weather" but not
+#   "io.github.acmeevil/weather" or "io.github.acme.labs/weather". The
+#   registry's `status: active` alone is carried by every published entry and
+#   verifies nothing. Empty or absent: every entry is unverified and refused.
+#
+# allow_force_unverified: whether the `force_unverified` argument of
+#   `hangar_load` may load an entry that is not verified. The argument is the
+#   caller's, and the caller is an agent. false (default): it is ignored.
+#
+# inherit_env: names a hot-loaded server takes from the gateway's environment
+#   on top of a fixed base (PATH, HOME, USER, LOGNAME, LANG, LC_ALL, LC_CTYPE,
+#   TZ, TMPDIR, TMP, TEMP, and the Windows equivalents). Nothing else is
+#   inherited: list a proxy, a CA bundle or UV_*/npm_config_* settings here if
+#   uvx or npx need them. Statically configured servers are unaffected.
+#
+# secrets.allow: the exact registry name of a server -> the environment
+#   variables it may receive. A variable its entry asks for and that is not
+#   listed here is reported missing and never looked up, even when the gateway
+#   has it set. A listed one is read from the gateway's environment, then from
+#   ~/.config/mcp-hangar/secrets/<registry name>/<NAME> (one directory per `/`
+#   segment: secrets/io.github.acme/weather/WEATHER_API_KEY), then from
+#   ~/.config/mcp-hangar/secrets/<NAME>.
+#
+# hot_loading:
+#   enabled: true
+#   trusted_namespaces: ["io.github.acme/"]
+#   allow_force_unverified: false
+#   inherit_env: []
+#   secrets:
+#     allow:
+#       "io.github.acme/weather": [WEATHER_API_KEY]

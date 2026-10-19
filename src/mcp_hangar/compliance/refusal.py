@@ -1,0 +1,100 @@
+"""What the compliance formats share about a tool call's outcome (#1582).
+
+A refused call reaches the exporters with ``status="denied"``. Each format used
+to map a status it did not know to ``ToolInvocationRequested``, so a refusal
+read as a request that had merely been made. It is its own event type now, the
+same in all four formats.
+
+The refusal's bounded attributes (ADR-029's ``hangar.gate.*`` and
+``hangar.l7.*``) are written under one short key per format. A key outside that
+vocabulary is dropped rather than passed through: the formats carry codes, never
+text a gate was handed (#1276).
+"""
+
+from collections.abc import Mapping
+
+from mcp_hangar.observability.conventions import L7, Gate
+
+#: The event type of a call Hangar refused before it reached the upstream.
+TOOL_INVOCATION_DENIED = "ToolInvocationDenied"
+
+#: (convention key, key in ``AuditRecord.data`` and JSON lines, key in CEF, LEEF and syslog).
+REFUSAL_FIELDS: tuple[tuple[str, str, str], ...] = (
+    (Gate.NAME, "gate", "gate"),
+    (Gate.REASON, "gate_reason", "gateReason"),
+    (L7.VERDICT, "l7_verdict", "l7Verdict"),
+    (L7.MODE, "l7_mode", "l7Mode"),
+    (L7.RULE_KIND, "l7_rule_kind", "l7RuleKind"),
+    (L7.POLICY_ID, "l7_policy_id", "l7PolicyId"),
+)
+
+
+#: The ``AuditRecord.data`` key of the server a call was routed to (#1594): the
+#: selected member for a group call, whose record names the group as its
+#: server; the server itself on a standalone call. ADR-029's
+#: ``hangar.route.backend``. Each format writes it under its own convention:
+#: ``route_backend`` in JSON lines, ``routeBackend`` in LEEF and syslog, and
+#: the labelled ``flexString1`` in CEF, whose six ``cs`` slots are all taken.
+ROUTE_BACKEND = "route_backend"
+
+#: The ``AuditRecord.data`` key of what authorized the call (#1347): the role
+#: its allow decision matched, or ``opa_policy``, comma-separated as
+#: ``mcp.caller.roles`` is. Absent when nothing authorized it. Each format
+#: writes it under its own convention: ``caller_roles`` in JSON lines, the
+#: predefined ``role`` in LEEF, ``roles`` in syslog, and ``spriv`` -- the
+#: dictionary's source-user privileges -- in CEF.
+CALLER_ROLES = "caller_roles"
+
+
+#: The caller and cost fields of a tool-call record (#1705): the
+#: ``AuditRecord.data`` key and its camelCase wire key in LEEF and syslog. They
+#: mirror ``mcp.caller.type``, ``mcp.caller.id`` and the ``mcp.cost.*`` span
+#: attributes; a JSON-lines record keeps the data key as it is. Present only
+#: when the call has them -- a zero cost is a value and is kept, an absent one
+#: is left out. CEF writes them with its dictionary's names instead
+#: (``cef_formatter``).
+CALLER_COST_FIELDS: tuple[tuple[str, str], ...] = (
+    ("caller_type", "callerType"),
+    ("caller_id", "callerId"),
+    ("cost_cents", "costCents"),
+    ("cost_model", "costModel"),
+    ("cost_input_tokens", "costInputTokens"),
+    ("cost_output_tokens", "costOutputTokens"),
+)
+
+#: What ``error_type`` holds in every format (#1705). It is the bounded
+#: classifier of ``ToolInvocationFailed.error_type`` and is written exactly as
+#: the event carries it, never mapped to another vocabulary: the exception class
+#: name of a failure on this side (``TimeoutError``), the upstream's JSON-RPC
+#: error code as a string (``-32601``), ``tool_error`` for a result the tool
+#: marked as an error, or ``other`` for an upstream error with no usable code.
+#: The upstream's message is never part of it. JSON lines write it as
+#: ``error_type``, CEF and LEEF as ``reason``, syslog as ``error``.
+ERROR_TYPE_CONTRACT = "the event's error_type, written as given"
+
+
+def caller_cost_data(data: Mapping[str, object]) -> list[tuple[str, str, object]]:
+    """The caller and cost fields held in *data*, as (data key, wire key, value), zero kept."""
+    return [(key, wire, data[key]) for key, wire in CALLER_COST_FIELDS if data.get(key) is not None]
+
+
+def event_type_for_status(status: str) -> str:
+    """The audit event type a tool call's *status* is written as."""
+    if status in ("success", "completed"):
+        return "ToolInvocationCompleted"
+    if status in ("error", "failure", "failed"):
+        return "ToolInvocationFailed"
+    if status == "denied":
+        return TOOL_INVOCATION_DENIED
+    return "ToolInvocationRequested"
+
+
+def refusal_data(refusal: Mapping[str, str] | None) -> dict[str, str]:
+    """*refusal* under its ``AuditRecord.data`` keys; anything outside the vocabulary is left out."""
+    given = refusal or {}
+    return {data_key: given[key] for key, data_key, _wire in REFUSAL_FIELDS if given.get(key)}
+
+
+def refusal_wire_fields(data: Mapping[str, object]) -> list[tuple[str, str]]:
+    """The refusal fields held in *data*, as (wire key, value) in vocabulary order."""
+    return [(wire, str(data[data_key])) for _key, data_key, wire in REFUSAL_FIELDS if data.get(data_key)]

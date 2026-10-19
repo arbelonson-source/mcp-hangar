@@ -12,6 +12,7 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
+from .config_path import DEFAULT_RULE_HELP
 from .errors import CLIError, handle_cli_error
 
 # Global state
@@ -54,8 +55,10 @@ def main_callback(
         typer.Option(
             "--config",
             "-c",
-            help="Path to config.yaml file",
-            envvar="MCP_CONFIG",
+            # No `envvar`: `resolve_config_path` reads $MCP_CONFIG, below every
+            # flag. Typer folding it in here let a subcommand's env-filled
+            # option outrank this flag (#1657).
+            help="Path to config.yaml. " + DEFAULT_RULE_HELP,
         ),
     ] = None,
     verbose: Annotated[
@@ -120,16 +123,19 @@ def main_callback(
 
     # If no subcommand, default to serve
     if ctx.invoked_subcommand is None:
-        # Import and run the serve command
-        from .commands.serve import serve_command
-
-        serve_command(ctx)
+        # Through the `serve` command's own option parsing, so its environment
+        # bindings (MCP_HTTP_HOST, MCP_HTTP_PORT, MCP_LOG_LEVEL, MCP_JSON_LOGS)
+        # apply. Calling the function directly handed it only its Python
+        # defaults, and a bare `mcp-hangar` ignored every one of them (#1651).
+        serve = ctx.command.get_command(ctx, "serve")  # type: ignore[attr-defined]
+        with serve.make_context("serve", [], parent=ctx) as serve_ctx:
+            serve.invoke(serve_ctx)
 
 
 # Import and register subcommand modules
 def _register_commands():
     """Register all subcommand modules."""
-    from .commands import add, auth, completion, config, init, pin, remove, serve, status
+    from .commands import add, auth, completion, config, init, pin, remove, serve, status, why
 
     app.add_typer(init.app, name="init")
     app.command(name="status")(status.status_command)
@@ -137,6 +143,7 @@ def _register_commands():
     app.command(name="remove")(remove.remove_command)
     app.command(name="serve")(serve.serve_command)
     app.command(name="pin")(pin.pin_command)
+    app.command(name="why")(why.why_command)
     app.add_typer(completion.app, name="completion")
     app.add_typer(auth.app, name="auth")
     app.add_typer(config.app, name="config")

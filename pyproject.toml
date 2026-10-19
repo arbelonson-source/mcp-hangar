@@ -1,6 +1,6 @@
 [project]
 name = "mcp-hangar"
-version = "2.23.0"
+version = "2.30.0"
 description = "Policy enforcement plane for MCP: every tool call ends in a verdict. Self-hosted, MIT."
 readme = "README.md"
 license = {text = "MIT"}
@@ -21,23 +21,32 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 dependencies = [
-    # Pinned EXACTLY, not merely bounded, and now on the stable 2.0.0.
+    # Pinned EXACTLY, not merely bounded. This pin is a contract with the SDK, and
+    # what it protects against is a wrong wire, not an ImportError.
     #
-    # The exactness is no longer about beta drift -- it is that `_sdk_compat`
-    # shims specific SDK internals (`_lowlevel_server`, `add_request_handler`,
-    # `MCPError`, `HANDSHAKE_PROTOCOL_VERSIONS`) and the relay registers custom
-    # `tasks/*` methods that the SDK deliberately does not carry in
-    # `SPEC_CLIENT_METHODS`. A floating pin lets any of that move under us
-    # silently, and the failure mode is a wrong wire rather than an ImportError.
-    # Bump deliberately, with the relay smoke harness run against the candidate.
+    # Why exact: `_sdk_compat` shims SDK internals (`_lowlevel_server`,
+    # `add_request_handler`, `MCPError`, `HANDSHAKE_PROTOCOL_VERSIONS`), the front
+    # door installs its own `tools/list` and `tools/call` handlers, and the relay
+    # registers `tasks/*` methods the SDK deliberately does not carry in
+    # `SPEC_CLIENT_METHODS`. Any of those can change between two SDK releases
+    # without a failing import, and 2.3.0 proved it: it stopped running the
+    # `tools/list` handler before dispatch and asked `get_tool_input_schema`
+    # instead, so every `Mcp-Param-*` check on a projected tool was silently
+    # skipped (#1791) -- a deny that did not deny.
+    #
+    # How to move it: run the weekly canary against the candidate (#1793), then
+    # the full integration tier, the relay smoke (`task-relay-smoke.yml`, by
+    # dispatch) and the conformance workflow. A failure there is the pin doing its
+    # job. Move `mcp` and `mcp-types` together to the same version, and raise the
+    # floors in `scripts/check_dependency_floors.py` that the move implies.
     #
     # The v1 line on `main` solves the same class of problem with `>=1.28.1,<2`
     # (#561): both branches must be unable to follow the SDK somewhere their
     # code does not run. Do not widen either to match the other.
-    "mcp==2.0.0",
-    "mcp-types==2.0.0",  # v2 split protocol-types dist (imported directly as mcp_types); paired with mcp
+    "mcp==2.3.0",
+    "mcp-types==2.3.0",  # v2 split protocol-types dist (imported directly as mcp_types); paired with mcp
     "structlog>=24.0.0",
-    # Mirrors the floor `mcp==2.0.0` declares; we inherit it rather than choose it.
+    # Mirrors the floor `mcp==2.3.0` declares; we inherit it rather than choose it.
     # Declared at the same value so the metadata cannot claim an install that the
     # resolver can never produce (see scripts/check_dependency_floors.py).
     "pydantic>=2.12.0",
@@ -52,10 +61,17 @@ dependencies = [
     # satisfies the constraint, so a floor is what an existing environment keeps.
     # pyjwt 2.13.0 fixes CVE-2026-48522/48523/48524/48525/48526 and CVE-2026-32597;
     # 48524 and 48525 are pre-auth DoS on the JWKS path (`get_signing_key_from_jwt`).
+    # 2.14.0 fixes PYSEC-2026-4140 and 4142..4152 (4145: an HMAC/asymmetric
+    # allow-list accepts a non-canonical PEM public key as the HMAC secret);
+    # 2.15.0 fixes PYSEC-2026-4141.
     # `[crypto]` because JWKS RS256/ES256 needs it; it arrived only via `mcp` before.
-    "pyjwt[crypto]>=2.13.0",
+    "pyjwt[crypto]>=2.15.0",
     # 50.0.0 fixes CVE-2026-69247; 49.0.0 fixes CVE-2026-69248/69249.
     "cryptography>=50.0.0",
+    # not imported directly; arrives via mcp/httpx/starlette. 4.14.2 fixes
+    # GHSA-82r6-8w77-94w6 (TLSStream IDNA 2003 host name encoding) and
+    # GHSA-5p39-cfhj-2xmp (process-pool workers blocked on undrained stderr).
+    "anyio>=4.14.2",
     "pyyaml>=6.0",
     "docker>=7.1.0",
     "aiosqlite>=0.19.0",
@@ -68,6 +84,11 @@ dependencies = [
     "protobuf>=6.33.5",
     "jcs>=0.2.1",
     "click>=8.3.3",  # security floor: PYSEC-2026-2132 (click.edit() command injection); transitive via typer
+    # not imported directly; uvicorn needs a WebSocket library to upgrade a
+    # connection, and without one `/api/ws/events` answers 404 (#1676). Only the
+    # Dockerfile installed it before. 16.0 is the first release with Python 3.14
+    # wheels, above uvicorn[standard]'s own >=13.0 and every known advisory (<9.1).
+    "websockets>=16.0",
 ]
 [project.optional-dependencies]
 dev = [
@@ -76,15 +97,22 @@ dev = [
     "pytest-asyncio>=1.3.0",  # first release that admits pytest 9 (the pytest floor above)
     "pytest-timeout>=2.2.0",
     "pytest-benchmark>=5.1.0",
+    # Parallel runs: CI passes `-n auto --dist loadfile` (see ci-core.yml).
+    "pytest-xdist>=3.6.0",
     # Pinned, not a floor: this is the version CI lints with. A floor would let
     # every machine resolve a different ruff, which is how a rule that fires
     # locally stays invisible in CI. Dependabot bumps it (uv ecosystem), and CI
     # follows automatically because it installs from here.
-    "ruff==0.16.8",
+    "ruff==0.16.9",
     "import-linter==2.15",
     "mypy>=1.8.0",
     "hypothesis>=6.90.0",
     "jsonschema>=4.20.0",
+    # The discovery security check's HTTP client (security_validator.py). In a
+    # deployment the kubernetes extra brings it; without it here the check is
+    # skipped in every test run and its tests can only skip (#1756). Security
+    # floor: the deps-floor-audit job refuses anything older than 3.14.3.
+    "aiohttp>=3.14.3",
 ]
 # The kubernetes discovery source imports this. Until now it was declared
 # nowhere -- not a dependency, not an extra, not in the image -- so the source
@@ -101,7 +129,6 @@ dev = [
 # the normal test suite everywhere.
 fuzz = ["atheris>=3.1.0; sys_platform == 'linux' and python_version >= '3.12' and platform_machine == 'x86_64'"]
 kubernetes = ["kubernetes>=29.0.0"]
-langfuse = ["langfuse>=2.0.0"]
 # 1.35 is the lowest release that installs beside the core dependencies:
 # `opentelemetry-proto` requires `protobuf<6` through 1.34.x, and the core
 # requires `protobuf>=6.33.5` (`mcp` alone already needs the API at >=1.28).
@@ -148,7 +175,7 @@ Repository = "https://github.com/mcp-hangar/mcp-hangar"
 # `hatch` at plugin-load time, then prove it with `docker build .` and the
 # `build` job -- not with a local `pip install`, which has `hatch` on hand and
 # therefore cannot reproduce the failure.
-requires = ["hatchling==1.32.3"]
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 [tool.hatch.build]
 exclude = ["/.github/brand"]
@@ -237,7 +264,6 @@ module = [
     "prometheus_client.*",
     "kubernetes.*",
     "psycopg2.*",
-    "langfuse.*",
     "opentelemetry.*",
     "watchdog.*",
     "aiohttp.*",
@@ -295,9 +321,10 @@ relative_files = true
 #     Pinning those branches with deterministic tests would let this rise again.
 #
 # Two entries are visible debt rather than a target:
-#   approvals/persistence/sqlite_approval_repository.py at 31.2 -- the store
+#   approvals/persistence/sqlite_approval_repository.py at 64.9 -- the store
 #     holding approval state, tenant scoping and the arguments hash. Unit tests
-#     use a fake repository, so the real SQL paths are barely exercised.
+#     use a fake repository; the real SQL of `transition` is exercised by the
+#     multi-process race test (#1794), the rest of the paths barely.
 #   domain/value_objects/tool_access_policy.py at 84.2 -- _CompositePolicy's
 #     merge and approval-list handling, i.e. the consent-preservation logic.
 #   server/tools/batch/executor.py at 85.3 -- the invoke path, including the
@@ -311,13 +338,13 @@ drift_allowance = 3.0
   "application/tasks/tool_pin_context.py" = 94.4
   "approvals/api/routes.py" = 90.0
   "approvals/bootstrap.py" = 98.3
-  "approvals/commands/resolve.py" = 92.5
+  "approvals/commands/resolve.py" = 96.7
   "approvals/delivery/event_stream.py" = 100.0
   "approvals/delivery/noop.py" = 100.0
   "approvals/hold_registry.py" = 100.0
   "approvals/models.py" = 97.9
   "approvals/pending.py" = 100.0
-  "approvals/persistence/sqlite_approval_repository.py" = 31.2
+  "approvals/persistence/sqlite_approval_repository.py" = 64.9
   "approvals/service.py" = 96.1
   "auth/commands/handlers.py" = 99.2
   "auth/infrastructure/middleware.py" = 96.9
@@ -360,7 +387,16 @@ drift_allowance = 3.0
   # 92.0 -> 94.0 with the per-tenant budget's tests (#1445), which drive the
   # budget gate, the token refund in _run_gates and the slot step: 95.34 on
   # 3.11, past the allowance. Set under that by more than the CI swing above.
-  "server/tools/batch/executor.py" = 94.0
+  # 94.0 -> 96.0 with the route tests (#1286), which drive every route branch
+  # of _gate_resolve_target: 97.00 in CI, past the allowance. Set a point
+  # under it for the swing.
+  "server/tools/batch/executor.py" = 96.0
+  # The two largest files that decide what a caller sees and what boots, with no
+  # floor until #1787. Measured on 3.11 over unit + integration: 96.60 and 96.12.
+  # Set under them for the run-to-run swing, as the others are; the unit of
+  # progress is raising them.
+  "fastmcp_server/flat_tool_projection.py" = 96.0
+  "server/config.py" = 95.5
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -420,9 +456,7 @@ exported_unreferenced = [
   "domain/exceptions.py::ClientNotConnectedError",
   "domain/exceptions.py::ClientTimeoutError",
   "domain/value_objects/common.py::ToolArguments",
-  "infrastructure/command_bus.py::reset_command_bus",
   "infrastructure/persistence/event_serializer.py::register_event_type",
-  "infrastructure/query_bus.py::reset_query_bus",
   "retry.py::get_retry_policy",
   "server/__init__.py::cli_main",
   "server/cli/errors.py::InvalidConfigError",

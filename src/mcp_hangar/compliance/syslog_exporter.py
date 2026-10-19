@@ -1,16 +1,25 @@
 """RFC 5424 syslog audit exporter for compliance events."""
 
-import logging
 import os
 import socket
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 
 from mcp_hangar.application.event_handlers.audit_handler import AuditRecord
+from mcp_hangar.observability.health import ComplianceExportStatus
 
-logger = logging.getLogger(__name__)
+from .file_output import FileOutput
+from .refusal import (
+    CALLER_ROLES,
+    ROUTE_BACKEND,
+    TOOL_INVOCATION_DENIED,
+    caller_cost_data,
+    event_type_for_status,
+    refusal_data,
+    refusal_wire_fields,
+)
 
 FACILITY_LOCAL0 = 16
 APP_NAME = "mcp-hangar"
@@ -20,6 +29,7 @@ _MSG_ID_MAP: dict[str, str] = {
     "ToolInvocationRequested": "100",
     "ToolInvocationCompleted": "101",
     "ToolInvocationFailed": "102",
+    TOOL_INVOCATION_DENIED: "103",
     "ProviderStateChanged": "202",
 }
 
@@ -27,16 +37,10 @@ _SEVERITY_MAP: dict[str, int] = {
     "ToolInvocationRequested": 6,
     "ToolInvocationCompleted": 6,
     "ToolInvocationFailed": 3,
+    # Warning, the level `batch_call_refused` logs a refusal at: a decision, not a failure.
+    TOOL_INVOCATION_DENIED: 4,
     "ProviderStateChanged": 4,
 }
-
-
-def _event_type_for_status(status: str) -> str:
-    if status in ("success", "completed"):
-        return "ToolInvocationCompleted"
-    if status in ("error", "failure", "failed"):
-        return "ToolInvocationFailed"
-    return "ToolInvocationRequested"
 
 
 def _escape_sd_value(value: str) -> str:
@@ -47,15 +51,21 @@ def _format_structured_data(record: AuditRecord) -> str:
     data: dict[str, object] = dict(record.data or {})
     fields = {
         "provider": record.provider_id,
+        # An SD-PARAM beside `provider`, camelCase as the others (#1594).
+        "routeBackend": data.get(ROUTE_BACKEND) or None,
         "tool": data.get("tool_name"),
         "status": data.get("status"),
         "duration": data.get("duration_ms"),
         "user": record.caller_user_id,
+        "roles": data.get(CALLER_ROLES) or None,  # what authorized the call (#1347)
         "session": record.caller_session_id,
         "tenant": record.tenant_id or None,  # an empty tenant is no tenant
         "error": data.get("error_type"),
         "fromState": data.get("from_state"),
         "toState": data.get("to_state"),
+        **dict(refusal_wire_fields(data)),
+        # SD-PARAMs beside the others, camelCase (#1705). A zero cost is a value.
+        **{wire: value for _key, wire, value in caller_cost_data(data)},
     }
     params = " ".join(f'{key}="{_escape_sd_value(str(value))}"' for key, value in fields.items() if value is not None)
     return f"[{SD_ID}{(' ' + params) if params else ''}]"
@@ -91,17 +101,14 @@ class SyslogExporter:
     ) -> None:
         self._output_fn: Callable[[str], None] | None = output_fn
         self._output_path: Path | None = Path(output_path) if output_path else None
+        self._file: FileOutput | None = FileOutput(self._output_path, "syslog") if self._output_path else None
         self._lines_exported: int = 0
 
     def _emit(self, syslog_line: str) -> None:
         if self._output_fn is not None:
             _ = self._output_fn(syslog_line)
-        elif self._output_path is not None:
-            try:
-                with self._output_path.open("a", encoding="utf-8") as f:
-                    _ = f.write(syslog_line + "\n")
-            except OSError as e:
-                logger.error("Failed to write syslog line to %s: %s", self._output_path, e)
+        elif self._file is not None:
+            if not self._file.append(syslog_line):
                 return
         else:
             _ = sys.stderr.write(syslog_line + "\n")
@@ -125,6 +132,8 @@ class SyslogExporter:
         cost_input_tokens: int | None = None,
         cost_output_tokens: int | None = None,
         tenant_id: str | None = None,
+        refusal: Mapping[str, str] | None = None,
+        route_backend: str | None = None,
     ) -> None:
         data: dict[str, str | float | int] = {
             "tool_name": tool_name,
@@ -138,7 +147,7 @@ class SyslogExporter:
         if caller_id:
             data["caller_id"] = caller_id
         if caller_roles:
-            data["caller_roles"] = caller_roles
+            data[CALLER_ROLES] = caller_roles
         if cost_cents is not None:
             data["cost_cents"] = cost_cents
         if cost_model:
@@ -147,10 +156,13 @@ class SyslogExporter:
             data["cost_input_tokens"] = cost_input_tokens
         if cost_output_tokens is not None:
             data["cost_output_tokens"] = cost_output_tokens
+        data.update(refusal_data(refusal))
+        if route_backend:
+            data[ROUTE_BACKEND] = route_backend
 
         record = AuditRecord(
             event_id="",
-            event_type=_event_type_for_status(status),
+            event_type=event_type_for_status(status),
             occurred_at=datetime.now(UTC),
             mcp_server_id=mcp_server_id,
             data=data,
@@ -188,3 +200,8 @@ class SyslogExporter:
     @property
     def lines_exported(self) -> int:
         return self._lines_exported
+
+    @property
+    def export_status(self) -> ComplianceExportStatus | None:
+        """The file feed's write health; None when the output is not a file."""
+        return self._file.status if self._file is not None else None

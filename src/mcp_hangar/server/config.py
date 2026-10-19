@@ -22,11 +22,15 @@ import yaml
 from ..application.ports.config_loader import IConfigLoader, PreparedServers
 from ..domain.exceptions import ConfigurationError, ConfigurationUnavailableError
 from ..domain.model import LoadBalancerStrategy, McpServer, McpServerGroup, McpServerMode
+from ..domain.security.hot_load_trust import HotLoadTrust, parse_hot_load_trust, set_hot_load_trust
 from ..domain.security.input_validator import validate_mcp_server_id
+from ..domain.security.ssrf import TrustedNetwork, parse_trusted_networks, set_trusted_networks
 from ..domain.value_objects.capabilities import McpServerCapabilities
+from ..domain.value_objects.config import MaxConsecutiveFailures
 from ..domain.value_objects.tool_digest import DigestEnforcement, ToolDigest
 from ..logging_config import get_logger
 from ..metrics import remove_group_series
+from ..response_limit import parse_max_response_bytes, resolve_max_response_bytes, set_default_max_response_bytes
 from .bootstrap.group_circuit_metric import observe_group_circuit
 from .config_schema import ConfigSchemaError, strict_mode, validate_config
 from .state import GROUPS, get_group_rebalance_saga, get_runtime
@@ -210,6 +214,16 @@ class _StagedConfig:
 #: built with. A reload keeps the running server only when the file would build
 #: it with the same ones (#1424, #1426).
 _BUILT_FROM: dict[str, tuple[dict[str, Any], McpServer]] = {}
+
+
+def declared_in_config(mcp_server_id: str) -> bool:
+    """Whether the configuration in force declares *mcp_server_id*.
+
+    Read from the servers the last committed configuration built, which a
+    reload replaces as a whole: a server the file no longer declares is out of
+    it, and one the API or a discovery source added was never in it (#1744).
+    """
+    return mcp_server_id in _BUILT_FROM
 
 
 def _kept_or_built(mcp_server_id: str, built_with: dict[str, Any], built: McpServer) -> McpServer:
@@ -643,19 +657,42 @@ def build_config(config: dict[str, Any]) -> _StagedConfig:
                 logger.warning("skipping_invalid_mcp_server_id", mcp_server_id=mcp_server_id)
                 continue
 
-            mode = spec_dict.get("mode", "subprocess")
+            with _naming(mcp_server_id):
+                mode = spec_dict.get("mode", "subprocess")
 
-            if mode == "group":
-                groups.append((mcp_server_id, spec_dict))
-                # A call that names the group is limited under the group's id.
-                _stage_concurrency_limit(mcp_server_id, spec_dict.get("max_concurrency"))
-                continue
+                if mode == "group":
+                    groups.append((mcp_server_id, spec_dict))
+                    # A call that names the group is limited under the group's id.
+                    _stage_concurrency_limit(mcp_server_id, spec_dict.get("max_concurrency"))
+                    continue
 
-            _load_mcp_server_config(mcp_server_id, spec_dict)
+                _load_mcp_server_config(mcp_server_id, spec_dict)
 
         for group_id, spec_dict in groups:
-            _load_group_config(group_id, spec_dict)
+            with _naming(group_id):
+                _load_group_config(group_id, spec_dict)
     return staged
+
+
+@contextmanager
+def _naming(mcp_server_id: str) -> Iterator[None]:
+    """Turn a malformed block into a refusal that names the server (#1787).
+
+    A block of the wrong shape reached the loader's own reads as an
+    ``AttributeError`` (a ``.get`` on a string), a ``TypeError`` or a bare
+    ``ValueError``, and boot ended in a traceback that named none of the
+    config. The fuzz target found that a typo in about one spec in six did it.
+    A refusal the loader already raises as ``ConfigurationError`` is left as it is.
+    """
+    try:
+        yield
+    except ConfigurationError:
+        raise
+    except (ValueError, TypeError, AttributeError, KeyError) as exc:
+        raise ConfigurationError(
+            f"Invalid configuration for '{mcp_server_id}': {type(exc).__name__}: {exc}. "
+            "Check that each block is the kind of value the reference documents (a mapping, a list or a string)."
+        ) from exc
 
 
 def _parse_strategy(strategy_str: str, group_id: str) -> LoadBalancerStrategy:
@@ -732,6 +769,7 @@ def _load_group_members(
         # removes anything, and reusing the running aggregate would ignore an
         # edited inline member (#1424).
         member_mcp_server = _staged_config().servers.get(member_id)
+        defined_inline = member_mcp_server is None
         if member_mcp_server is None:
             if not _defines_a_server(member_spec):
                 raise ConfigurationError(
@@ -764,11 +802,17 @@ def _load_group_members(
             priority=member_spec.get("priority", 1),
         )
 
-        # Parse member-level tool access policy
-        member_tools_config = member_spec.get("tools")
-        if isinstance(member_tools_config, dict):
+        # Parse member-level tool access policy. A list is the tool schemas of
+        # a server this entry defines inline, which `_load_mcp_server_config`
+        # read above; on a member that names a declared server it is nothing.
+        if "tools" in member_spec and not (defined_inline and isinstance(member_spec["tools"], list)):
+            member_tools_config = _require_mapping(
+                member_spec["tools"], f"tools access policy for group '{group_id}' member '{member_id}'"
+            )
             try:
-                tools_access_config = parse_tools_access_config(member_tools_config)
+                tools_access_config = parse_tools_access_config(
+                    member_tools_config, where=f"mcp_servers.{group_id}.members.{member_id}.tools"
+                )
                 if tools_access_config is not None:
                     member_tools_policy = tools_access_config.to_policy()
                     resolver.set_member_policy(
@@ -785,13 +829,11 @@ def _load_group_members(
                         has_deny_list=bool(member_tools_policy.deny_list),
                         has_approval_list=bool(member_tools_policy.approval_list),
                     )
-            except ValueError as e:
-                logger.warning(
-                    "invalid_member_tools_access_config",
-                    group_id=group_id,
-                    member_id=member_id,
-                    error=str(e),
-                )
+            except (ValueError, TypeError) as e:
+                # Refused, never dropped: a dropped policy is no policy (#1648).
+                raise ConfigurationError(
+                    f"Invalid tools access policy for group '{group_id}' member '{member_id}': {e}"
+                ) from e
 
         if saga:
             saga.register_member(member_id, group_id)
@@ -803,6 +845,7 @@ def _register_config_pins(
     pins: Any,
     *,
     tenant_id: str | None,
+    upstream: str | None = None,
 ) -> None:
     """Register a `{tool_name: sha256}` pin block on the projection registry.
 
@@ -816,6 +859,7 @@ def _register_config_pins(
         mcp_server_id: Owning mcp_server identifier.
         pins: The raw mapping from the config file; a non-mapping is ignored.
         tenant_id: Tenant the pins apply to, or ``None`` for all tenants.
+        upstream: The upstream identity the block's pins are bound to (``tool_projection.upstream``), if any (#1802).
     """
     if not isinstance(pins, dict):
         return
@@ -832,7 +876,7 @@ def _register_config_pins(
             )
             continue
         try:
-            digest = ToolDigest(tool_name=tool_name, sha256=sha256)
+            digest = ToolDigest(tool_name=tool_name, sha256=sha256, upstream=upstream)
         except ValueError as e:
             logger.warning(
                 "invalid_config_digest_pin",
@@ -865,8 +909,21 @@ _WITHDRAWAL_KEYS: dict[str, str] = {
 }
 
 
+def _require_mapping(block: Any, what: str, *, expected: str = "a mapping") -> dict[str, Any]:
+    """Refuse a policy block that is present and is not a mapping (#1728).
+
+    Every site used to skip a block of any other shape, so `tools: add`, a
+    `tool_access.member` tenant entry of `add` or `access: {prompt: add}`
+    booted that scope with no policy at all. A key written with no value (YAML
+    null) is refused too: a block is there, and what it says is unreadable.
+    """
+    if not isinstance(block, dict):
+        raise ConfigurationError(f"Invalid {what}: expected {expected}, got {type(block).__name__} {block!r}")
+    return block
+
+
 def _register_access_policies(
-    access_config: Any,
+    scope: dict[str, Any],
     register: Callable[[Any, "PolicyKind"], None],
     *,
     where: str,
@@ -894,15 +951,18 @@ def _register_access_policies(
     ``resources/read`` / ``prompts/get`` at all is #1045; until that is answered
     the answer here is "not supported", not "invalid".
 
-    A missing or non-mapping block registers nothing, which leaves that kind
-    unrestricted for this scope -- the rule tools have always followed for an
-    undefined scope, applied per kind.
+    A missing block, or a missing kind, registers nothing, which leaves that
+    kind unrestricted for this scope -- the rule tools have always followed for
+    an undefined scope, applied per kind. A block or a kind that is present and
+    is not a mapping is refused (#1728): it used to register nothing too.
 
     Raises:
-        ConfigurationError: When a non-tool kind carries an ``approval_list``.
+        ConfigurationError: When the block or a kind is not a mapping, a policy
+            does not parse, or a non-tool kind carries an ``approval_list``.
     """
-    if not isinstance(access_config, dict):
+    if "access" not in scope:
         return
+    access_config = _require_mapping(scope["access"], f"access block on {where}")
 
     from ..domain.model.mcp_server_config import parse_tools_access_config
 
@@ -910,19 +970,17 @@ def _register_access_policies(
         logger.warning("unknown_access_kind", where=where, kind=unknown, known=list(_ACCESS_KINDS))
 
     for kind in _ACCESS_KINDS:
-        spec = access_config.get(kind)
-        if not isinstance(spec, dict):
+        if kind not in access_config:
             continue
+        spec = _require_mapping(access_config[kind], f"access.{kind} policy on {where}")
         try:
-            parsed = parse_tools_access_config(spec)
-        except ValueError as e:
-            logger.warning("invalid_access_config", where=where, kind=kind, error=str(e))
-            continue
+            parsed = parse_tools_access_config(spec, where=f"{where}.access.{kind}")
+        except (ValueError, TypeError) as e:
+            # Refused, never dropped: a dropped policy leaves the kind unrestricted (#1648).
+            raise ConfigurationError(f"Invalid access.{kind} policy on {where}: {e}") from e
         if parsed is None:
             continue
         if parsed.approval_list:
-            from ..domain.exceptions import ConfigurationError
-
             raise ConfigurationError(
                 f"access.{kind}.approval_list on {where} asks for a human approval hold that no "
                 f"{kind} path performs: the gate runs on tool calls only, so an approval-listed "
@@ -999,10 +1057,21 @@ def _register_tool_projection_block(scope_id: str, tool_projection_config: Any) 
 
     Args:
         scope_id: The mcp_server or group id the entries are keyed under.
-        tool_projection_config: The block, or anything else (ignored).
+        tool_projection_config: The block, or None when the entry has none.
+
+    Raises:
+        ConfigurationError: If the block is not a mapping, or ``digest_enforcement``
+            is not one of the modes. Both used to be dropped with at most a log
+            line, which left a server on the default mode while its file said
+            otherwise.
     """
-    if not isinstance(tool_projection_config, dict):
+    if tool_projection_config is None:
         return
+    if not isinstance(tool_projection_config, dict):
+        raise ConfigurationError(
+            f"Invalid tool_projection for '{scope_id}': expected a mapping, got "
+            f"{type(tool_projection_config).__name__} {tool_projection_config!r}"
+        )
 
     tp_registry = _staged_config().projections
 
@@ -1012,16 +1081,35 @@ def _register_tool_projection_block(scope_id: str, tool_projection_config: Any) 
         try:
             tp_registry.set_digest_enforcement(scope_id, DigestEnforcement(enforcement_raw))
         except ValueError:
-            logger.warning(
-                "invalid_digest_enforcement_config",
-                mcp_server_id=scope_id,
-                value=enforcement_raw,
-            )
+            raise ConfigurationError(
+                f"Invalid tool_projection.digest_enforcement for '{scope_id}': expected one of "
+                f"{', '.join(repr(mode.value) for mode in DigestEnforcement)}, got {enforcement_raw!r}"
+            ) from None
 
     # All-tenants digest pins: {tool_name: sha256}. The counterpart of
     # `withdrawn:`, and the only pin that holds a caller carrying no tenant
     # identity -- which is every caller when auth is off (#902).
-    _register_config_pins(tp_registry, scope_id, tool_projection_config.get("pins", {}), tenant_id=None)
+    # The upstream the pins were taken from (#1802): the pins hold only for a server
+    # that still points at it. A value that is not a string is refused by name, not
+    # dropped, because dropping it would leave the pins unbound and unsaid.
+    # What happens to a tool that appears after the pins were taken (#1801).
+    new_tools = tool_projection_config.get("new_tools")
+    if new_tools is not None:
+        if new_tools not in ("withhold", "allow"):
+            raise ConfigurationError(
+                f"Invalid tool_projection.new_tools for '{scope_id}': expected 'withhold' or 'allow', got {new_tools!r}"
+            )
+        tp_registry.set_new_tools_policy(scope_id, new_tools)
+
+    upstream = tool_projection_config.get("upstream")
+    if upstream is not None and not (isinstance(upstream, str) and upstream):
+        raise ConfigurationError(
+            f"Invalid tool_projection.upstream for '{scope_id}': expected the identity string "
+            f"`mcp-hangar pin` writes, got {type(upstream).__name__} {upstream!r}"
+        )
+    _register_config_pins(
+        tp_registry, scope_id, tool_projection_config.get("pins", {}), tenant_id=None, upstream=upstream
+    )
 
     # Global withdrawals (all tenants), of every kind.
     _register_config_withdrawals(tp_registry, scope_id, tool_projection_config, tenant_id=None)
@@ -1032,7 +1120,46 @@ def _register_tool_projection_block(scope_id: str, tool_projection_config: Any) 
             if not isinstance(tenant_spec, dict):
                 continue
             _register_config_withdrawals(tp_registry, scope_id, tenant_spec, tenant_id=tenant_id_key)
-            _register_config_pins(tp_registry, scope_id, tenant_spec.get("pins", {}), tenant_id=tenant_id_key)
+            _register_config_pins(
+                tp_registry, scope_id, tenant_spec.get("pins", {}), tenant_id=tenant_id_key, upstream=upstream
+            )
+
+
+def _max_consecutive_failures(mcp_server_id: str, spec_dict: dict[str, Any]) -> int:
+    """The server's failure threshold, refused when outside 1-100 (#1665).
+
+    `MaxConsecutiveFailures` holds the range and nothing called it, so 0 and 500
+    both booted: 0 degrades a server on its first success-less tick, 500 never.
+    """
+    value = spec_dict.get("max_consecutive_failures", 3)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigurationError(
+            f"mcp_server '{mcp_server_id}': max_consecutive_failures must be an integer, got {value!r}"
+        )
+    try:
+        return int(MaxConsecutiveFailures(value))
+    except ValueError as e:
+        raise ConfigurationError(
+            f"mcp_server '{mcp_server_id}': max_consecutive_failures {value}: {e} (allowed 1-100)"
+        ) from e
+
+
+def _subprocess_command(mcp_server_id: str, spec_dict: dict[str, Any]) -> Any:
+    """The command a subprocess server runs: its `command` followed by its `args` (#1658).
+
+    `args` was read for docker only, so a subprocess server started without the
+    paths `init` and `add` write there, and nothing said so.
+    """
+    command = spec_dict.get("command")
+    args = spec_dict.get("args")
+    if args is None or McpServerMode.normalize(spec_dict.get("mode", "subprocess")) != McpServerMode.SUBPROCESS:
+        return command
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise ConfigurationError(f"mcp_server '{mcp_server_id}': args must be a list of strings, got {args!r}")
+    if not isinstance(command, list):
+        # No command, or one the server refuses by its own check: leave it to that check.
+        return command
+    return [*command, *args]
 
 
 @_within_staging
@@ -1052,34 +1179,44 @@ def _load_mcp_server_config(mcp_server_id: str, spec_dict: dict[str, Any]) -> Mc
     # 1. A list of predefined tool schemas
     # 2. A dict with allow_list/deny_list/approval_list for access policy
     tools_config = spec_dict.get("tools")
-    tools = None
+    tools: list[dict[str, Any]] | None = None
     tools_access_policy = None
 
-    if tools_config:
-        if isinstance(tools_config, list):
-            # List format: predefined tool schemas
-            tools = []
-            for tool_spec in tools_config:
-                tools.append(
-                    {
-                        "name": tool_spec.get("name"),
-                        "description": tool_spec.get("description", ""),
-                        "inputSchema": tool_spec.get("inputSchema", tool_spec.get("input_schema", {})),
-                        "outputSchema": tool_spec.get("outputSchema", tool_spec.get("output_schema")),
-                    }
-                )
-        elif isinstance(tools_config, dict):
-            # Dict format: access policy (allow_list / deny_list / approval_list)
-            try:
-                tools_access_config = parse_tools_access_config(tools_config)
-                if tools_access_config is not None:
-                    tools_access_policy = tools_access_config.to_policy()
-            except ValueError as e:
-                logger.warning(
-                    "invalid_tools_access_config",
-                    mcp_server_id=mcp_server_id,
-                    error=str(e),
-                )
+    if isinstance(tools_config, list):
+        # List format: predefined tool schemas
+        tools = []
+        for tool_spec in tools_config:
+            # `tools: [add]` reads as an allow list and is not one (#1728).
+            _require_mapping(
+                tool_spec,
+                f"tool schema in the tools list of mcp_server '{mcp_server_id}'",
+                expected="a mapping with a name (a tool access policy is a mapping: tools: {deny_list: [...]})",
+            )
+            tools.append(
+                {
+                    "name": tool_spec.get("name"),
+                    "description": tool_spec.get("description", ""),
+                    "inputSchema": tool_spec.get("inputSchema", tool_spec.get("input_schema", {})),
+                    "outputSchema": tool_spec.get("outputSchema", tool_spec.get("output_schema")),
+                }
+            )
+        tools = tools or None
+    elif "tools" in spec_dict:
+        # Dict format: access policy (allow_list / deny_list / approval_list).
+        # Anything else is refused, never skipped: a skipped block is no policy (#1728).
+        tools_config = _require_mapping(
+            tools_config,
+            f"tools access policy for mcp_server '{mcp_server_id}'",
+            expected="a mapping (an access policy) or a list (tool schemas)",
+        )
+        try:
+            tools_access_config = parse_tools_access_config(tools_config, where=f"mcp_servers.{mcp_server_id}.tools")
+            if tools_access_config is not None:
+                tools_access_policy = tools_access_config.to_policy()
+        except (ValueError, TypeError) as e:
+            # Refused, never dropped: logging it and booting enforced no
+            # policy on the server, so a typo turned enforcement off (#1648).
+            raise ConfigurationError(f"Invalid tools access policy for mcp_server '{mcp_server_id}': {e}") from e
 
     # Process auth configuration for remote mcp_servers.
     #
@@ -1100,8 +1237,6 @@ def _load_mcp_server_config(mcp_server_id: str, spec_dict: dict[str, Any]) -> Mc
         try:
             capabilities = McpServerCapabilities.from_dict(capabilities_data)
         except (ValueError, TypeError) as e:
-            from ..domain.exceptions import ConfigurationError
-
             raise ConfigurationError(f"Invalid capabilities for mcp_server '{mcp_server_id}': {e}") from e
     else:
         logger.warning(
@@ -1110,17 +1245,25 @@ def _load_mcp_server_config(mcp_server_id: str, spec_dict: dict[str, Any]) -> Mc
             hint="Add a 'capabilities' block to declare resource requirements",
         )
 
+    try:
+        max_response_bytes = parse_max_response_bytes(
+            spec_dict.get("max_response_bytes"), f"mcp_servers.{mcp_server_id}.max_response_bytes"
+        )
+    except ValueError as e:
+        raise ConfigurationError(str(e)) from e
+
     # Everything the server is built from, and nothing else: a reload keeps the
     # running server when these are unchanged (#1426).
     built_with: dict[str, Any] = {
         "mode": spec_dict.get("mode", "subprocess"),
-        "command": spec_dict.get("command"),
+        "command": _subprocess_command(mcp_server_id, spec_dict),
         "image": spec_dict.get("image"),
         "endpoint": spec_dict.get("endpoint"),
         "env": spec_dict.get("env", {}),
         "idle_ttl_s": spec_dict.get("idle_ttl_s", 300),
         "health_check_interval_s": spec_dict.get("health_check_interval_s", 60),
-        "max_consecutive_failures": spec_dict.get("max_consecutive_failures", 3),
+        "max_consecutive_failures": _max_consecutive_failures(mcp_server_id, spec_dict),
+        "max_response_bytes": max_response_bytes,
         "volumes": spec_dict.get("volumes", []),
         "build": spec_dict.get("build"),
         "resources": spec_dict.get("resources", {"memory": "512m", "cpu": "1.0"}),
@@ -1168,7 +1311,7 @@ def _load_mcp_server_config(mcp_server_id: str, spec_dict: dict[str, Any]) -> Mc
     # kind in the SAME resolver the `tools:` block above feeds, so one config
     # reload cannot leave the two surfaces disagreeing.
     _register_access_policies(
-        spec_dict.get("access"),
+        spec_dict,
         lambda policy, kind: _staged_config().policies.set_mcp_server_policy(mcp_server_id, policy, kind=kind),
         where=f"mcp_servers.{mcp_server_id}",
     )
@@ -1180,25 +1323,38 @@ def _load_mcp_server_config(mcp_server_id: str, spec_dict: dict[str, Any]) -> Mc
     #       deny_list: [dangerous_tool]
     #       access:
     #         prompt: {deny_list: [internal_*]}
-    tool_access_config = spec_dict.get("tool_access")
-    if isinstance(tool_access_config, dict):
-        member_policies_config = tool_access_config.get("member", {})
-        if isinstance(member_policies_config, dict):
+    #
+    # Each level that is present must be a mapping: one that was not was
+    # skipped, and the tenant got no policy (#1728).
+    if "tool_access" in spec_dict:
+        tool_access_config = _require_mapping(
+            spec_dict["tool_access"], f"tool_access block on mcp_servers.{mcp_server_id}"
+        )
+        if "member" in tool_access_config:
+            member_policies_config = _require_mapping(
+                tool_access_config["member"], f"tool_access.member block on mcp_servers.{mcp_server_id}"
+            )
             resolver = _staged_config().policies
-            for tenant_id, member_policy_spec in member_policies_config.items():
-                if not isinstance(member_policy_spec, dict):
-                    continue
+            for tenant_id, raw_member_policy_spec in member_policies_config.items():
+                member_policy_spec = _require_mapping(
+                    raw_member_policy_spec,
+                    f"tools access policy on mcp_servers.{mcp_server_id}.tool_access.member.{tenant_id}",
+                )
 
                 def _register_member_access(policy: Any, kind: "PolicyKind", tenant_id: str = tenant_id) -> None:
                     resolver.set_standalone_member_policy(mcp_server_id, tenant_id, policy, kind=kind)
 
                 _register_access_policies(
-                    member_policy_spec.get("access"),
+                    member_policy_spec,
                     _register_member_access,
                     where=f"mcp_servers.{mcp_server_id}.tool_access.member.{tenant_id}",
                 )
                 try:
-                    member_tools_cfg = parse_tools_access_config(member_policy_spec)
+                    member_tools_cfg = parse_tools_access_config(
+                        member_policy_spec,
+                        where=f"mcp_servers.{mcp_server_id}.tool_access.member.{tenant_id}",
+                        extra_keys=("access",),
+                    )
                     if member_tools_cfg is not None:
                         member_policy = member_tools_cfg.to_policy()
                         resolver.set_standalone_member_policy(mcp_server_id, tenant_id, member_policy)
@@ -1210,13 +1366,12 @@ def _load_mcp_server_config(mcp_server_id: str, spec_dict: dict[str, Any]) -> Mc
                             has_deny_list=bool(member_policy.deny_list),
                             has_approval_list=bool(member_policy.approval_list),
                         )
-                except ValueError as e:
-                    logger.warning(
-                        "invalid_standalone_member_tools_access_config",
-                        mcp_server_id=mcp_server_id,
-                        tenant_id=tenant_id,
-                        error=str(e),
-                    )
+                except (ValueError, TypeError) as e:
+                    # Refused, never dropped: a dropped policy is no policy (#1648).
+                    raise ConfigurationError(
+                        "Invalid tools access policy on "
+                        f"mcp_servers.{mcp_server_id}.tool_access.member.{tenant_id}: {e}"
+                    ) from e
 
     _register_tool_projection_block(mcp_server_id, spec_dict.get("tool_projection"))
     _register_header_exposure_block(mcp_server_id, spec_dict.get("header_exposure"))
@@ -1278,19 +1433,17 @@ def _load_group_config(group_id: str, spec_dict: dict[str, Any]) -> None:
     )
 
     # Parse group-level tool access policy
-    group_tools_config = spec_dict.get("tools")
     group_tools_policy = None
-    if isinstance(group_tools_config, dict):
+    if "tools" in spec_dict:
+        # A group is not a server and has no tool schemas: a mapping is its only form.
+        group_tools_config = _require_mapping(spec_dict["tools"], f"tools access policy for group '{group_id}'")
         try:
-            tools_access_config = parse_tools_access_config(group_tools_config)
+            tools_access_config = parse_tools_access_config(group_tools_config, where=f"mcp_servers.{group_id}.tools")
             if tools_access_config is not None:
                 group_tools_policy = tools_access_config.to_policy()
-        except ValueError as e:
-            logger.warning(
-                "invalid_group_tools_access_config",
-                group_id=group_id,
-                error=str(e),
-            )
+        except (ValueError, TypeError) as e:
+            # Refused, never dropped: a dropped policy is no policy (#1648).
+            raise ConfigurationError(f"Invalid tools access policy for group '{group_id}': {e}") from e
 
     # Register group-level policy
     if group_tools_policy is not None:
@@ -1313,7 +1466,7 @@ def _load_group_config(group_id: str, spec_dict: dict[str, Any]) -> None:
     # Group-level prompt / resource policies (#1028), same block shape as a
     # server's. A group member is checked against its group on every surface.
     _register_access_policies(
-        spec_dict.get("access"),
+        spec_dict,
         lambda policy, kind: _staged_config().policies.set_group_policy(group_id, policy, kind=kind),
         where=f"mcp_servers.{group_id}",
     )
@@ -1686,6 +1839,77 @@ def _tenant_limits(full_config: dict[str, Any]) -> dict[str, TenantLimits]:
     return parse_tenant_limits(execution_config.get("tenant_limits") if isinstance(execution_config, dict) else None)
 
 
+def _init_ssrf_from_config(full_config: dict[str, Any]) -> None:
+    """Put ``ssrf.trusted_networks`` in force (#1752).
+
+    ::
+
+        ssrf:
+          trusted_networks: ["10.96.0.0/12"]
+
+    The private networks a remote endpoint registered over the API may resolve
+    into -- for the Kubernetes operator, the cluster's Service range. Every
+    caller allowed to register a server gets them, not only the operator. Read
+    by the registration check and by the connect-time check on every request,
+    so a reload that narrows the list refuses the next connection; an absent
+    section trusts nothing.
+    """
+    networks = _trusted_networks(full_config)
+    set_trusted_networks(networks)
+    if networks:
+        logger.info("ssrf_trusted_networks_configured", networks=[str(n) for n in networks])
+
+
+def _trusted_networks(full_config: dict[str, Any]) -> tuple[TrustedNetwork, ...]:
+    """The checked ``ssrf.trusted_networks``, empty when there is none."""
+    section = full_config.get("ssrf")
+    if section is None:
+        return ()
+    if not isinstance(section, dict):
+        raise ConfigurationError(f"ssrf must be a mapping, got {type(section).__name__}")
+    try:
+        return parse_trusted_networks(section.get("trusted_networks"))
+    except ValueError as e:
+        raise ConfigurationError(str(e)) from e
+
+
+def _init_hot_load_trust_from_config(full_config: dict[str, Any]) -> None:
+    """Put the `hot_loading` trust keys in force.
+
+    ::
+
+        hot_loading:
+          trusted_namespaces: ["io.github.acme/"]
+          allow_force_unverified: false
+          secrets:
+            allow:
+              "io.github.acme/weather": [WEATHER_API_KEY]
+
+    Which registry entries are verified, whether a caller's `force_unverified`
+    may load one that is not, and what a server loaded from the registry may
+    receive. Its registry entry names the variables it wants, and
+    only the ones listed here for its exact registry name are looked up. Read
+    by the load handler on every load, so a reload that narrows either list
+    applies to the next load; an absent section trusts and binds nothing.
+    """
+    trust = _hot_load_trust(full_config)
+    set_hot_load_trust(trust)
+    if trust.trusted_namespaces:
+        logger.info("hot_loading_trusted_namespaces_configured", namespaces=list(trust.trusted_namespaces))
+    if trust.allow_force_unverified:
+        logger.warning("hot_loading_force_unverified_allowed")
+    if trust.secrets_allow:
+        logger.info("hot_loading_secrets_allowlist_configured", servers=sorted(trust.secrets_allow))
+
+
+def _hot_load_trust(full_config: dict[str, Any]) -> HotLoadTrust:
+    """The checked trust keys of ``hot_loading``, the default when there are none."""
+    try:
+        return parse_hot_load_trust(full_config.get("hot_loading"))
+    except ValueError as e:
+        raise ConfigurationError(str(e)) from e
+
+
 def _init_interceptors_from_config(full_config: dict[str, Any]) -> None:
     """Register opt-in built-in interceptors (validators) from configuration.
 
@@ -1710,6 +1934,31 @@ def _validator_specs(full_config: dict[str, Any]) -> list[dict[str, Any]] | None
         if isinstance(raw, list):
             return raw
     return None
+
+
+def _init_response_limit_from_config(full_config: dict[str, Any]) -> None:
+    """Apply ``execution.max_response_bytes`` or ``MCP_MAX_RESPONSE_BYTES`` (#1613).
+
+    ::
+
+        execution:
+          max_response_bytes: 33554432
+
+    The most bytes of one upstream response either transport reads before it
+    fails the call with ``ResponseTooLarge``, for every server without its own
+    ``max_response_bytes``. The environment wins over the file, as it does for
+    ``observability.tracing.caller_ids``, and is read here, once, not per call.
+    Absent means 32 MiB. An invalid value is a hard error: a limit that quietly
+    fell back to the default would read as applied.
+    """
+    set_default_max_response_bytes(_max_response_bytes(full_config))
+
+
+def _max_response_bytes(full_config: dict[str, Any]) -> int:
+    try:
+        return resolve_max_response_bytes(full_config)
+    except ValueError as e:
+        raise ConfigurationError(str(e)) from e
 
 
 def http_graceful_shutdown_timeout(full_config: dict[str, Any]) -> int | None:
@@ -1769,8 +2018,11 @@ _PROCESS_SECTIONS: tuple[Callable[[dict[str, Any]], None], ...] = (
     _init_required_catalogue_from_config,
     _init_param_validation_from_config,
     _init_resource_links_from_config,
+    _init_response_limit_from_config,
     _init_interceptors_from_config,
     _init_ui_resources_from_config,
+    _init_ssrf_from_config,
+    _init_hot_load_trust_from_config,
 )
 
 
@@ -1793,7 +2045,10 @@ def check_process_config(full_config: dict[str, Any]) -> None:
     required_catalogue(full_config)
     _param_validation_required(full_config)
     _max_links_per_tenant(full_config)
+    _max_response_bytes(full_config)
     _ui_resource_policies(full_config)
+    _trusted_networks(full_config)
+    _hot_load_trust(full_config)
     # Checked, not applied: `run_http` reads it when the server starts (#1447).
     http_graceful_shutdown_timeout(full_config)
     try:
@@ -1814,8 +2069,8 @@ def apply_process_config(full_config: dict[str, Any]) -> None:
     """Apply every process-wide section of a configuration: startup's step, and a reload's.
 
     `tool_access.mode`, `tool_access.required_catalogue`, `execution`,
-    `headers.param_validation`, `resource_links`, `interceptors` and
-    `ui_resources`. A section that is absent is put back to its default, so
+    `headers.param_validation`, `resource_links`, `interceptors`,
+    `ui_resources`, `ssrf` and the trust keys of `hot_loading`. A section that is absent is put back to its default, so
     deleting a block and reloading removes it. Checked first, so nothing is
     applied unless all of it can be.
     """
@@ -1871,10 +2126,12 @@ class ServerConfigLoader(IConfigLoader):
 
 
 def load_configuration(config_path: str | None = None, *, load_servers: bool = True) -> dict[str, Any]:
-    """Load mcp_server configuration from file or use defaults.
+    """Load the configuration file, or refuse.
 
     Args:
-        config_path: Where to read from. Defaults to `MCP_CONFIG`.
+        config_path: Where to read from. Without one, the CLI's order decides
+            (`resolve_config_path`): `MCP_CONFIG`, then `./config.yaml`, then
+            `~/.config/mcp-hangar/config.yaml`.
         load_servers: Whether to build the declared servers as well as read the
             file. **Bootstrap passes False**, and the reason is not tidiness:
             building a server reaches for the runtime, and the runtime is a
@@ -1888,26 +2145,25 @@ def load_configuration(config_path: str | None = None, *, load_servers: bool = T
 
     Returns:
         Full configuration dictionary
+
+    Raises:
+        MissingConfigFileError: If the file is not a readable regular file.
+            There is no fallback: a missing file used to boot a built-in demo
+            configuration with every `hangar_*` tool and none of the operator's
+            pins, policies or auth, so a typo in `--config` served an
+            ungoverned gateway (#1650).
     """
+    # Here, not at the top: the `cli` package imports the command modules.
+    from .cli.config_path import ConfigPathSource, ResolvedConfigPath, require_config_file, resolve_config_path
+
     if config_path is None:
-        config_path = os.getenv("MCP_CONFIG", "config.yaml")
+        resolved = resolve_config_path()
+    else:
+        resolved = ResolvedConfigPath(Path(config_path), ConfigPathSource.ARGUMENT)
+    source = str(require_config_file(resolved))
 
-    if Path(config_path).exists():
-        logger.info("loading_config_from_file", config_path=config_path)
-        return apply_configuration(_read_config_file(config_path), source=config_path, load_servers=load_servers)
-
-    logger.info("config_not_found_using_default", config_path=config_path)
-    default_config = {
-        "math_subprocess": {
-            "mode": "subprocess",
-            "command": ["python", "-m", "examples.provider_math.server"],
-            # Explicit even though the subprocess launcher now defaults to
-            # it: this config is what a reader copies as a starting point.
-            "env": {"MCP_TRANSPORT": "stdio"},
-            "idle_ttl_s": 180,
-        },
-    }
-    return apply_configuration({"mcp_servers": default_config}, source="the default config", load_servers=load_servers)
+    logger.info("loading_config_from_file", config_path=source)
+    return apply_configuration(_read_config_file(source), source=source, load_servers=load_servers)
 
 
 def apply_configuration(config: Any, *, source: str, load_servers: bool = True) -> dict[str, Any]:

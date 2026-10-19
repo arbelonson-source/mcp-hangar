@@ -21,6 +21,7 @@ from unittest.mock import Mock
 import pytest
 
 from mcp_hangar import metrics as prometheus_metrics
+from mcp_hangar.context import PARAM_VALIDATION_KEY, PARAM_VALIDATION_RAN
 from mcp_hangar.domain.events.enforcement import EgressPolicyEnforced, EgressPolicyViolationObserved
 from mcp_hangar.domain.exceptions import EgressPolicyApprovalRequiredError, EgressPolicyDeniedError
 from mcp_hangar.domain.model.mcp_server import McpServer
@@ -33,6 +34,7 @@ from mcp_hangar.domain.policies.egress_l7 import (
     ToolRules,
     evaluate,
 )
+from mcp_hangar.infrastructure.observability.l7_verdicts import L7Decision
 from mcp_hangar.infrastructure.observability.metrics_event_handler import MetricsEventHandler
 from mcp_hangar.metrics import get_metrics
 
@@ -160,7 +162,11 @@ class TestTheRuleKindTheVerdictRestsOn:
             tools=ToolRules(allow=("*",)),
             headers=HeaderRules(deny=(HeaderMatch("Mcp-Param-Region", ("eu-*",)),)),
         )
-        headers = {"mcp-param-region": "eu-west-1", "mcp-protocol-version": "2026-07-28"}
+        headers = {
+            "mcp-param-region": "eu-west-1",
+            "mcp-protocol-version": "2026-07-28",
+            PARAM_VALIDATION_KEY: PARAM_VALIDATION_RAN,
+        }
 
         assert evaluate("charge", {}, policy, headers).rule_kind == "header"
 
@@ -227,19 +233,24 @@ class TestTheFaultBarrierIsLoudForARefusal:
         monkeypatch.setattr(executor_module, "logger", _Recorder())
         return recorded
 
-    def test_a_refusal_logs_at_warning_with_its_reason(self, monkeypatch) -> None:
+    def test_a_refusal_logs_at_warning_with_its_bounded_verdict(self, monkeypatch) -> None:
+        """The policy's reasons are free text; the line carries the L7 verdict instead (#1295)."""
         from mcp_hangar.server.tools.batch.executor import _log_call_failure
 
         recorded = self._calls(monkeypatch)
         error = EgressPolicyDeniedError("s", "refund", "tool 'refund' matched a deny rule", policy_id="sha256:abc")
         call = type("_Call", (), {"call_id": "c1", "mcp_server": "s", "tool": "refund"})()
 
-        _log_call_failure(call, error, "EgressPolicyDeniedError", 1.0)
+        l7 = L7Decision(verdict="deny", mode="enforce", rule_kind="tool", policy_id=None, inspection_failed=False)
+
+        _log_call_failure(call, error, "EgressPolicyDeniedError", 1.0, l7)
 
         level, event, fields = recorded[0]
         assert level == "warning"
         assert event == "batch_call_refused"
-        assert fields["reason"] == "tool 'refund' matched a deny rule"
+        assert "reason" not in fields
+        assert "matched a deny rule" not in repr(fields)
+        assert (fields["l7_verdict"], fields["l7_mode"], fields["l7_rule_kind"]) == ("deny", "enforce", "tool")
         assert fields["policy_id"] == "sha256:abc"
 
     def test_an_upstream_failure_stays_at_debug(self, monkeypatch) -> None:

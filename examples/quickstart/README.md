@@ -127,7 +127,9 @@ MCP_TRACING_ENABLED=false docker compose up -d
 ```
 
 Or point it at a real collector via `OTEL_EXPORTER_OTLP_ENDPOINT` (see
-`examples/otel-collector/`).
+`examples/otel-collector/`). To find a request in the exported traces, or to
+tell sampled-out spans from spans that were never exported, see the
+[tracing diagnosis runbook](https://github.com/mcp-hangar/docs/blob/main/runbooks/tracing-diagnosis.md).
 
 An OTLP endpoint set explicitly, in `OTEL_EXPORTER_OTLP_ENDPOINT` or in
 `observability.tracing.otlp_endpoint`, also turns on OTLP export of audit
@@ -135,6 +137,12 @@ records, which carry caller identities. To export traces without them, set
 `MCP_AUDIT_EXPORT_ENABLED=false`, or `observability.audit.enabled: false` in
 `config.yaml`. The environment variable wins over the file, and the default is
 `true`.
+
+Spans carry the caller's tenant, principal type and correlation id, but not the
+caller's own identifiers. To put `mcp.caller.id`, `mcp.user.id`, `mcp.agent.id`
+and `mcp.session.id` on spans as well, set `MCP_TRACING_CALLER_IDS=true`, or
+`observability.tracing.caller_ids: true` in `config.yaml`. The environment
+variable wins over the file, and the default is `false`.
 
 ## Length limits
 

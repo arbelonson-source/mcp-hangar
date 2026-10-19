@@ -179,7 +179,7 @@ class TestGuardDoesNotOverreach:
         `test_operator_role_compatibility.py` already pins this contract, but it
         pins it against `resolve_rule` and the role definitions -- the table and
         the roles agreed, and the *handler* disagreed with both: it demanded
-        `mcp_servers:write` on top, which `provider-admin` does not hold. So the
+        `mcp_servers:write` on top, which the role did not hold then. So the
         operator's push answered 403 while every test of the contract passed.
 
         Asserted through the served stack for that reason: only the request path
@@ -190,6 +190,32 @@ class TestGuardDoesNotOverreach:
         response = client.request(method, path, json={"default_action": "deny"})
 
         assert response.status_code not in (401, 403), response.text
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("POST", "/api/mcp_servers"),
+            ("POST", "/api/mcp_servers/srv1/start"),
+            ("DELETE", "/api/mcp_servers/srv1"),
+            ("POST", "/api/mcp_servers/srv1/l7_policy"),
+        ],
+    )
+    def test_the_operator_role_reaches_what_the_operator_calls(self, client_factory, method, path):
+        """Registration, lifecycle, removal and policy delivery, through the served stack (#1827)."""
+        client = client_factory("kubernetes-operator")
+
+        response = client.request(method, path, json={"default_action": "deny"})
+
+        assert response.status_code not in (401, 403), response.text
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [("POST", "/api/groups"), ("POST", "/api/config/reload"), ("POST", "/api/auth/roles/assign")],
+    )
+    def test_the_operator_role_stops_there(self, client_factory, method, path):
+        client = client_factory("kubernetes-operator")
+
+        assert client.request(method, path, json={}).status_code == 403
 
     def test_non_api_paths_reach_the_mcp_surface(self, client_factory):
         """combined_app still routes everything else to the MCP app."""

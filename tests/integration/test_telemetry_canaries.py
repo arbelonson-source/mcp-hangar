@@ -1,0 +1,613 @@
+"""Synthetic canaries reach a sink only where the telemetry data contract allows (#1535).
+
+The contract is #1276's: telemetry carries bounded classifications, the caller
+and the event store carry text. This suite proves it against real exporters
+rather than restating it: ``_canary_harness.py`` bootstraps Hangar, serves the
+app ``serve --http`` serves, and drives one synthetic value per kind of input
+through it -- tool arguments, result text, ``isError`` text, an upstream's
+JSON-RPC error, inbound baggage and headers, an approver's reason -- over a
+stdio and an HTTP upstream, on both tool surfaces (``hangar_call`` and the front
+door's flat tools). Each run reads back the sinks ``SINKS`` lists.
+
+The upstream's error text and ``isError`` text also stand for exception
+messages: Hangar raises both as a ``ToolInvocationError`` carrying the text, so
+every span that records the exception is handed a message with a canary in it.
+
+``CONTRACT`` is the matrix: for each sink, the form each kind of canary may take
+there. Anything it does not name is forbidden, which is the contract's own
+allowlist rule. A sink or a kind added later is a row or a column here; the
+parametrisation picks it up.
+
+Before any cell is believed, ``test_the_canary_went_in`` proves the value
+entered the system on that surface and transport, and ``test_the_sink_was_read``
+that the sink is not trivially empty: an absence proves nothing about a value
+never sent or a sink never captured.
+
+Not covered here yet, and tracked on #1535: the live-gateway tier with a real
+OTLP receiver (#1293, ``tests/live``), exceptions raised on other paths (a
+transport failure, a validation error), metric labels and
+the rest of the identifier table. Of that table, the calling principal is a
+canary here too: ``PRINCIPAL_CONTRACT`` keeps it off every span by default
+(#1580).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from mcp_hangar.domain.events.base import EVENT_TEXT_LENGTH_LIMIT, FREE_TEXT_FIELDS
+from mcp_hangar.logging_config import LOG_FIELD_LENGTH_LIMIT
+from mcp_hangar.observability.tracing import SPAN_ATTRIBUTE_LENGTH_LIMIT
+
+from ._canary_upstream import BIG_RESULT_LENGTH, KINDS, PRINCIPAL, TRANSPORTS, canary, encoded, head, tail
+
+pytestmark = [pytest.mark.otel_sdk, pytest.mark.security]
+
+HARNESS = Path(__file__).with_name("_canary_harness.py")
+SURFACES = ("hangar_call", "front_door")
+
+#: The audit exporter's bound on a record attribute (#1343).
+AUDIT_ATTRIBUTE_LENGTH_LIMIT = 256
+
+#: kind -> the harness scenario that injects it.
+SCENARIO = {
+    "argument": "argument",
+    "secret_argument": "argument",
+    "result": "result",
+    "is_error": "is_error",
+    "rpc_error": "rpc_error",
+    "baggage": "argument",
+    "header": "argument",
+    "approver_reason": "approval",
+    "l7_argument": "argument",
+    "l7_header": "argument",
+    "l7_header_encoded": "argument",
+    "shaped_result": "shaping",
+}
+
+
+def _unreachable_endpoint() -> str:
+    """A loopback port nothing listens on: exports fail fast and stay local."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{probe.getsockname()[1]}"
+
+
+def _run(surface: str, tmp: Path, l7_mode: str = "audit") -> dict[str, Any]:
+    directory = tmp / f"{surface}-{l7_mode}"
+    directory.mkdir()
+    out = directory / "run.json"
+    # The limits are read from the environment; the suite checks the defaults.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("OTEL_", "MCP_TRACING_", "MCP_COMPLIANCE_")) and not k.endswith("_LENGTH_LIMIT")
+    }
+    env.update({"MCP_COMPLIANCE_FORMAT": "cef", "MCP_COMPLIANCE_OUTPUT": str(directory / "cef.log")})
+    # Under the 60s pytest-timeout the integration job applies.
+    result = subprocess.run(
+        [sys.executable, str(HARNESS), surface, str(out), _unreachable_endpoint(), l7_mode],
+        capture_output=True,
+        text=True,
+        timeout=45,
+        env=env,
+    )
+    assert result.returncode == 0 and out.exists(), f"harness exited {result.returncode}:\n{result.stderr[-4000:]}"
+    return json.loads(out.read_text())
+
+
+@pytest.fixture(scope="module")
+def runs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, Any]]:
+    tmp = tmp_path_factory.mktemp("canaries")
+    with ThreadPoolExecutor(max_workers=len(SURFACES)) as pool:
+        pending = {surface: pool.submit(_run, surface, tmp) for surface in SURFACES}
+        return {surface: future.result() for surface, future in pending.items()}
+
+
+# --- the sinks --------------------------------------------------------------
+
+
+def _logs(run: dict[str, Any]) -> list[Any]:
+    """The structured log, one record per line; a line that is not JSON is kept as text."""
+    records: list[Any] = []
+    for line in run["logs"]:
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            records.append(line)
+    return records
+
+
+def _carriers(run: dict[str, Any]) -> list[Any]:
+    """What crossed to the upstreams besides the call itself: ``_meta``, and the HTTP headers."""
+    seen = run["upstream_seen"]
+    return [r["meta"] for r in seen["stdio"]] + [{"meta": r["meta"], "headers": r["headers"]} for r in seen["http"]]
+
+
+#: sink -> its records in one run. Route numbers are #1276's.
+SINKS: dict[str, Callable[[dict[str, Any]], list[Any]]] = {
+    # R1: every exported span's name, attributes and links.
+    "span_attributes": lambda run: [{k: s[k] for k in ("name", "attributes", "links")} for s in run["spans"]],
+    # R2.
+    "span_status_descriptions": lambda run: [s["status_description"] for s in run["spans"]],
+    # R3, and the governance events on the same spans.
+    "span_events": lambda run: [e for s in run["spans"] for e in s["events"]],
+    # R4: outbound to both upstreams.
+    "upstream_carriers": _carriers,
+    # R6.
+    "otlp_audit_records": lambda run: run["audit"],
+    "compliance_cef": lambda run: run["compliance"]["cef"],
+    "compliance_leef": lambda run: run["compliance"]["leef"],
+    "compliance_jsonlines": lambda run: run["compliance"]["jsonlines"],
+    "compliance_syslog": lambda run: run["compliance"]["syslog"],
+    # R7, at INFO: the level `serve` defaults to.
+    "structured_logs": _logs,
+    # R8.
+    "ws_events": lambda run: run["ws_events"],
+    "event_store": lambda run: run["event_store"],
+}
+
+
+def _strings(value: Any) -> Iterator[str]:
+    """Every string in a JSON value, keys included."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield str(key)
+            yield from _strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _strings(item)
+
+
+def _mappings(value: Any) -> Iterator[dict[str, Any]]:
+    """Every mapping in a JSON value."""
+    if isinstance(value, dict):
+        yield value
+        for item in value.values():
+            yield from _mappings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _mappings(item)
+
+
+# --- the forms a canary may take ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class Forbidden:
+    """The contract does not name this input for this sink: no trace of it, cut or whole."""
+
+    def check(self, records: list[Any], kind: str, transport: str) -> None:
+        found = [s[:120] for s in _strings(records) if head(kind, transport) in s]
+        assert found == [], f"{len(found)} value(s) carry the canary: {found[:3]}"
+
+
+@dataclass(frozen=True)
+class Bounded:
+    """Kept here by design, but only cut to ``limit`` characters: never the whole long value."""
+
+    limit: int
+
+    def check(self, records: list[Any], kind: str, transport: str) -> None:
+        carried = [s for s in _strings(records) if head(kind, transport) in s]
+        assert carried, "the sink is meant to keep this input, and holds no trace of it"
+        uncut = tail(kind, transport)
+        for value in carried:
+            assert len(value) <= self.limit, f"{len(value)} characters, over the bound of {self.limit}"
+            assert uncut is None or uncut not in value, "the whole value, not a bounded copy"
+
+
+@dataclass(frozen=True)
+class Kept:
+    """Kept here as sent: a caller's own argument, persisted after redaction by key and shape."""
+
+    def check(self, records: list[Any], kind: str, transport: str) -> None:
+        assert canary(kind, transport) in set(_strings(records)), "the sink is meant to keep this input"
+
+
+@dataclass(frozen=True)
+class Redacted:
+    """Kept here only as the redaction marker, under ``key``: present as redacted, not merely absent."""
+
+    key: str
+    marker: str = "[REDACTED]"
+
+    def check(self, records: list[Any], kind: str, transport: str) -> None:
+        Forbidden().check(records, kind, transport)
+        # The records of this call: the ones holding the ordinary argument sent beside it.
+        beside = canary("argument", transport)
+        ours = [m for m in _mappings(records) if self.key in m and beside in m.values()]
+        assert ours, f"no record of the call keeps its arguments, so nothing shows {self.key!r} redacted"
+        assert {m[self.key] for m in ours} == {self.marker}, [m[self.key] for m in ours]
+
+
+@dataclass(frozen=True)
+class ShapeRedacted:
+    """Kept as sent except its secret-shaped part, which the argument redactor replaced by shape."""
+
+    def check(self, records: list[Any], kind: str, transport: str) -> None:
+        strings = list(_strings(records))
+        assert any(head(kind, transport) in s for s in strings), "the sink is meant to keep this input"
+        assert not [s for s in strings if canary(kind, transport) in s], "the secret-shaped part was kept"
+
+
+Rule = Forbidden | Bounded | Kept | Redacted | ShapeRedacted
+
+#: What #1276 allows each sink to carry; every cell it leaves out is ``Forbidden``.
+#: The event store and ``/ws/events`` are the one different trust boundary: they
+#: stay in the deployment behind ``audit:read``, keep the caller's (redacted)
+#: arguments, and keep upstream and approver text bounded at event creation.
+_RETAINED: dict[str, Rule] = {
+    "argument": Kept(),
+    "secret_argument": Redacted("api_token"),
+    "is_error": Bounded(EVENT_TEXT_LENGTH_LIMIT),
+    "rpc_error": Bounded(EVENT_TEXT_LENGTH_LIMIT),
+    "approver_reason": Bounded(EVENT_TEXT_LENGTH_LIMIT),
+    # The L7 canaries are arguments too (#1295); `l7_header` mirrors one, and
+    # `l7_header_encoded` mirrors one in sentinel form, decoded to the argument
+    # (#1600). Its sentinel form is kept nowhere (``ENCODED_KINDS``).
+    "l7_argument": ShapeRedacted(),
+    "l7_header": Kept(),
+    "l7_header_encoded": Kept(),
+}
+CONTRACT: dict[str, dict[str, Rule]] = {sink: {} for sink in SINKS}
+CONTRACT["event_store"] = dict(_RETAINED)
+CONTRACT["ws_events"] = dict(_RETAINED)
+
+#: Cells tracked outside this suite. Each is a strict xfail, so the change that
+#: resolves one has to delete its entry here.
+TRACKED_SEPARATELY: frozenset[tuple[str, str]] = frozenset()
+
+
+def _cells() -> Iterator[Any]:
+    for surface in SURFACES:
+        for sink in SINKS:
+            for kind in KINDS:
+                marks = []
+                if (sink, kind) in TRACKED_SEPARATELY:
+                    marks.append(pytest.mark.xfail(strict=True, reason="tracked separately"))
+                for transport in TRANSPORTS:
+                    yield pytest.param(
+                        surface, sink, kind, transport, marks=marks, id=f"{surface}-{sink}-{kind}-{transport}"
+                    )
+
+
+@pytest.mark.parametrize(("surface", "sink", "kind", "transport"), list(_cells()))
+def test_a_canary_takes_only_the_form_the_contract_allows(runs, surface, sink, kind, transport):
+    rule = CONTRACT[sink].get(kind, Forbidden())
+
+    rule.check(SINKS[sink](runs[surface]), kind, transport)
+
+
+#: Kinds sent on the wire in the sentinel form. The binding decodes it for the
+#: L7 selector (#1600); the wire form is kept by no sink, not even the ones
+#: that keep the argument it decodes to.
+ENCODED_KINDS = ("l7_header_encoded",)
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+@pytest.mark.parametrize("sink", SINKS)
+@pytest.mark.parametrize("kind", ENCODED_KINDS)
+def test_a_sentinel_canary_is_kept_by_no_sink_in_its_wire_form(runs, surface, sink, kind):
+    for transport in TRANSPORTS:
+        payload = encoded(kind, transport).removeprefix("=?base64?").removesuffix("?=")
+        found = [s[:120] for s in _strings(SINKS[sink](runs[surface])) if payload in s]
+        assert found == [], f"{len(found)} value(s) carry the sentinel canary: {found[:3]}"
+
+
+#: The identifier table of #1276, for the calling principal (the harness's API
+#: key is issued to ``PRINCIPAL``): for each sink, whether it must carry the
+#: principal (True), must not (False), or may (None). Spans carry caller ids
+#: only on the operator's opt-in (#1580), which this suite leaves off.
+PRINCIPAL_CONTRACT: dict[str, bool | None] = dict.fromkeys(SINKS, False) | {
+    # Caller identity in audit, whatever the span setting (#1342). Also the
+    # proof the principal went in, so an absence from the spans is a result.
+    "otlp_audit_records": True,
+    # Allowed by the table, and not what this suite pins.
+    "compliance_cef": None,
+    "compliance_leef": None,
+    "compliance_jsonlines": None,
+    "compliance_syslog": None,
+    "structured_logs": None,
+    "ws_events": None,
+    "event_store": None,
+}
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+@pytest.mark.parametrize("sink", SINKS)
+def test_the_principal_reaches_only_the_sinks_that_may_name_it(runs, surface, sink):
+    rule = PRINCIPAL_CONTRACT[sink]
+    carried = [s[:120] for s in _strings(SINKS[sink](runs[surface])) if PRINCIPAL in s]
+
+    if rule is True:
+        assert carried, "the sink is meant to name the caller, and holds no trace of the principal"
+    elif rule is False:
+        assert carried == [], f"{len(carried)} value(s) name the caller: {carried[:3]}"
+
+
+# --- that the matrix means something ----------------------------------------
+
+
+def _upstream_calls(run: dict[str, Any], transport: str) -> list[dict[str, Any]]:
+    return [r for r in run["upstream_seen"][transport] if r["method"] == "tools/call"]
+
+
+#: kind -> the argument key it is sent under.
+_ARGUMENT_KEYS = {
+    "argument": "note",
+    "secret_argument": "api_token",
+    "l7_argument": "ref",
+    "l7_header": "region",
+    "l7_header_encoded": "zone",
+}
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+@pytest.mark.parametrize("transport", TRANSPORTS)
+@pytest.mark.parametrize("kind", KINDS)
+def test_the_canary_went_in(runs, surface, kind, transport):
+    """The value entered on this surface and transport: an absence elsewhere is then a result."""
+    run = runs[surface]
+    response = run["calls"][f"{transport}:{SCENARIO[kind]}"]
+    assert "result" in response, response
+
+    if kind in _ARGUMENT_KEYS:
+        key = _ARGUMENT_KEYS[kind]
+        sent = [(r.get("arguments") or {}).get(key) for r in _upstream_calls(run, transport)]
+        assert canary(kind, transport) in sent, sent
+    elif kind == "shaped_result":
+        # The upstream has no other answer for `big_result`, so a call to it put
+        # the canary into Hangar. On `hangar_call` the batch budget then cut it
+        # before the caller saw it, and the caller holds a continuation id
+        # instead. A front-door flat call takes its result whole (#1609).
+        assert f"{transport}-big_result" in [r["tool"] for r in _upstream_calls(run, transport)]
+        if surface == "hangar_call":
+            assert _continuation_ids(response), json.dumps(response)[:500]
+        else:
+            whole = canary(kind, transport) + "-" + "y" * BIG_RESULT_LENGTH
+            assert response["result"]["content"] == [{"type": "text", "text": whole}], json.dumps(response)[:500]
+            assert not response["result"].get("isError"), json.dumps(response)[:500]
+    elif kind in ("result", "is_error", "rpc_error", "approver_reason"):
+        # The caller is owed the whole text; only telemetry is bounded.
+        value = canary(kind, transport)
+        assert any(value in s for s in _strings(response)), json.dumps(response)[:500]
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+@pytest.mark.parametrize("sink", SINKS)
+def test_the_sink_was_read(runs, surface, sink):
+    assert SINKS[sink](runs[surface]), f"{sink} holds nothing, so no canary could be found in it"
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_the_event_stream_carries_what_the_store_holds(runs, surface):
+    run = runs[surface]
+    streamed = {e["event_type"] for e in run["ws_events"]}
+    stored = sorted(e["event_id"] for e in run["event_store"] if e["event_type"] in streamed)
+
+    assert sorted(e["event_id"] for e in run["ws_events"]) == stored
+    assert {"ToolInvocationRequested", "ToolInvocationFailed", "ToolApprovalDenied"} <= streamed, streamed
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_both_upstreams_were_called_with_every_tool(runs, surface):
+    for transport in TRANSPORTS:
+        tools = sorted(r["tool"] for r in _upstream_calls(runs[surface], transport))
+        # `guarded` never reaches its upstream: the approver denies it.
+        expected = ("note", "result_text", "is_error", "rpc_error", "big_result")
+        assert tools == sorted(f"{transport}-{t}" for t in expected), tools
+
+
+# --- the bounds, whatever carries them ----------------------------------------
+
+
+def _long_strings(values: Iterator[str], limit: int) -> list[str]:
+    return [f"{len(v)}: {v[:80]}" for v in values if len(v) > limit]
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_no_span_attribute_exceeds_its_bound(runs, surface):
+    values = (v for s in runs[surface]["spans"] for v in _strings(list(s["attributes"].values())))
+
+    assert _long_strings(values, SPAN_ATTRIBUTE_LENGTH_LIMIT) == []
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_a_span_status_description_is_empty_or_its_error_type(runs, surface):
+    described = [s for s in runs[surface]["spans"] if s["status_description"]]
+
+    assert [s for s in described if s["status_description"] != s["attributes"].get("error.type")] == []
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_an_exception_event_carries_its_type_only(runs, surface):
+    events = [e["attributes"] for s in runs[surface]["spans"] for e in s["events"] if e["name"] == "exception"]
+
+    assert events, "no call failed, so R3 was not exercised"
+    assert [a for a in events if set(a) != {"exception.type"}] == []
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_outbound_meta_carries_trace_context_only(runs, surface):
+    metas = [set((r["meta"] or {}).keys()) for t in TRANSPORTS for r in _upstream_calls(runs[surface], t)]
+
+    assert metas and all(keys <= {"traceparent", "tracestate"} for keys in metas), metas
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_no_audit_attribute_exceeds_its_bound(runs, surface):
+    values = (v for r in runs[surface]["audit"] for v in _strings(list(r["attributes"].values())))
+
+    assert _long_strings(values, AUDIT_ATTRIBUTE_LENGTH_LIMIT) == []
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_no_log_field_exceeds_its_bound(runs, surface):
+    records = [r for r in _logs(runs[surface]) if isinstance(r, dict)]
+
+    assert _long_strings((v for r in records for v in _strings(list(r.values()))), LOG_FIELD_LENGTH_LIMIT) == []
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+@pytest.mark.parametrize("sink", ["event_store", "ws_events"])
+def test_no_free_text_event_field_exceeds_its_bound(runs, surface, sink):
+    values = (e[k] for e in runs[surface][sink] for k in FREE_TEXT_FIELDS if isinstance(e.get(k), str))
+
+    assert _long_strings(values, EVENT_TEXT_LENGTH_LIMIT) == []
+
+
+# --- the L7 canaries were matched, and an Enforce run refuses them (#1295) ----
+
+
+def _l7_spans(run: dict[str, Any]) -> list[dict[str, Any]]:
+    return [s["attributes"] for s in run["spans"] if "hangar.l7.verdict" in s["attributes"]]
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_the_audit_policy_observed_the_l7_canaries(runs, surface):
+    """Both canaries went through the policy: an absence of them elsewhere is then a result."""
+    verdicts = {(a["hangar.l7.verdict"], a.get("hangar.l7.rule_kind")) for a in _l7_spans(runs[surface])}
+
+    assert ("audit_observed", "argument") in verdicts, verdicts
+
+
+@pytest.fixture(scope="module")
+def enforced(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, Any]]:
+    tmp = tmp_path_factory.mktemp("canaries-enforced")
+    with ThreadPoolExecutor(max_workers=len(SURFACES)) as pool:
+        pending = {surface: pool.submit(_run, surface, tmp, "enforce") for surface in SURFACES}
+        return {surface: future.result() for surface, future in pending.items()}
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+@pytest.mark.parametrize("sink", [sink for sink in SINKS if not CONTRACT[sink]])
+@pytest.mark.parametrize("kind", ["l7_argument", "l7_header", "l7_header_encoded"])
+def test_an_enforced_refusal_keeps_the_l7_canaries_off_telemetry(enforced, surface, sink, kind):
+    """The deny path writes its own lines and events; none of them may carry what the policy matched."""
+    for transport in TRANSPORTS:
+        Forbidden().check(SINKS[sink](enforced[surface]), kind, transport)
+        if kind in ENCODED_KINDS:
+            payload = encoded(kind, transport).removeprefix("=?base64?").removesuffix("?=")
+            assert not [s for s in _strings(SINKS[sink](enforced[surface])) if payload in s]
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_an_enforced_refusal_logs_the_verdict_not_the_policy_reasons(enforced, surface):
+    lines = [r for r in _logs(enforced[surface]) if isinstance(r, dict) and r.get("event") == "batch_call_refused"]
+    l7 = [r for r in lines if r.get("error_type") == "EgressPolicyDeniedError"]
+
+    assert len(l7) == len(TRANSPORTS), lines
+    for line in l7:
+        assert (line["l7_verdict"], line["l7_mode"], line["l7_rule_kind"]) == ("deny", "enforce", "argument")
+        assert "reason" not in line
+        assert not [s for s in _strings(line) if "secret matching" in s or "aws-keys" in s or "matched" in s], line
+    verdicts = {a["hangar.l7.verdict"] for a in _l7_spans(enforced[surface])}
+    assert "deny" in verdicts, verdicts
+
+
+# --- a refused call is audited once, in bounded form (#1582) -----------------
+
+
+def _denied(run: dict[str, Any]) -> list[dict[str, Any]]:
+    return [r["attributes"] for r in run["audit"] if r["attributes"].get("mcp.tool.status") == "denied"]
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_an_approver_refusal_is_one_denied_audit_record_per_call(runs, surface):
+    """The approver's canary reason is kept off it by the matrix above; this proves the record exists."""
+    records = _denied(runs[surface])
+
+    assert sorted(r["gen_ai.tool.name"] for r in records) == sorted(f"{t}-guarded" for t in TRANSPORTS), records
+    for record in records:
+        assert (record["hangar.gate.name"], record["hangar.gate.reason"]) == ("approval", "approval_denied")
+        assert record["mcp.caller.tenant_id"] == "tenant-canary"
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+@pytest.mark.parametrize(
+    ("sink", "marker"),
+    [
+        ("compliance_cef", "|Tool Invocation Denied|"),
+        ("compliance_leef", "|103|"),
+        ("compliance_jsonlines", '"event_type": "ToolInvocationDenied"'),
+        ("compliance_syslog", " 103 [mcp@49152"),
+    ],
+)
+def test_every_compliance_format_receives_the_refusal(runs, surface, sink, marker):
+    lines = [line for line in SINKS[sink](runs[surface]) if marker in line]
+
+    assert len(lines) == len(TRANSPORTS), SINKS[sink](runs[surface])
+    assert all("approval_denied" in line for line in lines), lines
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_an_enforced_l7_refusal_is_one_denied_audit_record_per_call(enforced, surface):
+    records = [r for r in _denied(enforced[surface]) if "hangar.l7.verdict" in r]
+
+    assert sorted(r["gen_ai.tool.name"] for r in records) == sorted(f"{t}-note" for t in TRANSPORTS), records
+    for record in records:
+        assert (record["hangar.l7.verdict"], record["hangar.l7.rule_kind"]) == ("deny", "argument")
+        assert "hangar.gate.name" not in record
+
+
+# --- payload shaping: truncation cut a result, and said so without it (#1298) --
+
+
+def _continuation_ids(value: Any) -> list[str]:
+    """Every ``continuation_id`` in a response, including inside JSON carried as text."""
+    found: list[str] = []
+    for mapping in _mappings(value):
+        if isinstance(mapping.get("continuation_id"), str):
+            found.append(mapping["continuation_id"])
+    for text in _strings(value):
+        if text.lstrip().startswith("{"):
+            try:
+                found += _continuation_ids(json.loads(text))
+            except ValueError:
+                pass
+    return found
+
+
+@pytest.mark.parametrize("transport", TRANSPORTS)
+def test_batch_truncation_cut_the_big_result_and_recorded_counts_only(runs, transport):
+    """The proof the path ran: without a `batch.truncate` span, an absence of the id below proves nothing."""
+    run = runs["hangar_call"]
+    assert _continuation_ids(run["calls"][f"{transport}:shaping"]), "the big result was not cut"
+    truncates = [s for s in run["spans"] if s["name"] == "batch.truncate"]
+    cut = [s["attributes"] for s in truncates if s["attributes"].get("hangar.shaping.truncated_count")]
+
+    assert len(cut) == len(TRANSPORTS), [s["attributes"] for s in truncates]
+    assert all(a == {"hangar.shaping.truncated_count": 1, "hangar.shaping.continuation": True} for a in cut), cut
+
+
+def test_the_front_door_cut_nothing_and_stored_no_continuation(runs):
+    """Its flat calls take their result whole (#1609): no truncate span opens, and no id is minted."""
+    run = runs["front_door"]
+
+    assert [s for s in run["spans"] if s["name"] == "batch.truncate"] == []
+    assert not [i for transport in TRANSPORTS for i in _continuation_ids(run["calls"][f"{transport}:shaping"])]
+
+
+@pytest.mark.parametrize("sink", SINKS)
+def test_a_continuation_id_reaches_no_sink(runs, sink):
+    """Only the caller holds it: its random suffix is all that keeps a continuation unguessable."""
+    run = runs["hangar_call"]
+    ids = {i for transport in TRANSPORTS for i in _continuation_ids(run["calls"][f"{transport}:shaping"])}
+
+    assert len(ids) == len(TRANSPORTS), ids
+    found = [s[:120] for s in _strings(SINKS[sink](run)) if any(i in s for i in ids)]
+    assert found == [], f"{len(found)} value(s) carry a continuation id: {found[:3]}"

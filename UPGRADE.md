@@ -1,5 +1,979 @@
 # Upgrading MCP Hangar
 
+## Upgrade to 2.30.0
+
+### `hangar_load` loads only what the operator trusts, with only the environment and secrets bound to it
+
+Before, any server published in the registry could be loaded with
+`hangar_load`, because the registry marks every published entry
+`status: active` and that status was read as "verified". The variables its
+entry named were looked up in the gateway's environment and in the secrets
+directory and passed to it. It also inherited the gateway's whole environment,
+minus the names a heuristic called sensitive. A caller could load an entry
+that was not active by passing `force_unverified=True`.
+
+Now four `hot_loading` keys decide, and each defaults to refusing:
+
+- `trusted_namespaces`: a list of registry name prefixes. An entry is
+  verified when its name is under one of them **and** the registry lists it
+  as active. Anything else is refused with `status: unverified`. With the
+  default, an empty list, every `hangar_load` is refused until a namespace is
+  listed. Every namespace ends in `/`, one is added if it is left out, and
+  matching is case-sensitive by whole segment, so list each sub-namespace you
+  trust.
+- `allow_force_unverified`: `false` by default, and `force_unverified` is
+  then ignored. Set it to `true` only to let callers load entries that are
+  not verified, a deprecated entry in a trusted namespace included.
+- `secrets.allow`: the exact registry name of a server mapped to the
+  variables it may receive. A variable not listed is answered with
+  `status: missing_secrets`, even when the gateway has it set. Two keys that
+  differ only in case are refused.
+- `inherit_env`: names a hot-loaded server takes from the gateway's
+  environment, in addition to a fixed base: `PATH`, `HOME`, `USER`,
+  `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, `TMP`, `TEMP`,
+  and on Windows `SYSTEMROOT`, `COMSPEC`, `PATHEXT`, `APPDATA`,
+  `LOCALAPPDATA`, `USERPROFILE`. Hangar passes it nothing else from its
+  environment. A server that
+  needs a proxy (`HTTPS_PROXY`), a CA bundle (`SSL_CERT_FILE`) or `UV_*` and
+  `npm_config_*` settings to install needs them listed here. Statically
+  configured servers inherit as before.
+
+What Hangar hands the server is bounded; a hot-loaded server is code running
+as the gateway's user, so `trusted_namespaces` is the boundary. It can read
+whatever files that user can, the secrets directory and `~/.aws/credentials`
+included, on its own.
+
+To keep loading a server as before, add its namespace, its variables and
+anything its runtime needs from the environment:
+
+```yaml
+hot_loading:
+  trusted_namespaces: ["io.github.acme/"]
+  inherit_env: [HTTPS_PROXY]
+  secrets:
+    allow:
+      "io.github.acme/weather": [WEATHER_API_KEY]
+```
+
+A per-server secrets file is still read from
+`~/.config/mcp-hangar/secrets/<registry name>/<NAME>`, one directory per `/`
+segment of the name (`secrets/io.github.acme/weather/WEATHER_API_KEY`). A
+name with a segment outside `[A-Za-z0-9._-]`, or equal to `.` or `..`, has no
+per-server directory. A variable name that is not an environment variable
+name, or a file whose resolved path leaves the secrets directory, reads
+nothing.
+
+#### Changed signatures
+
+- `ServerSummary.is_official` and `ServerDetails.is_official` are now
+  `is_published`. It means only that the registry lists the entry as active.
+- `SecretsResolver.resolve(required, mcp_server_name)` is now
+  `SecretsResolver.resolve(required, mcp_server_name, *, allowed)`: `allowed`,
+  the names the server may receive, is a required keyword argument.
+- `SecretsResolver.get_missing_instructions(missing: list[str], mcp_server_name)`
+  is now `get_missing_instructions(result: SecretsResult, mcp_server_name)`.
+- `LoadMcpServerHandler` takes `trust`, a callable returning the
+  `HotLoadTrust` in force. Omitted, nothing is trusted or delivered.
+- `UnverifiedMcpServerError` takes the keyword arguments `force_ignored`,
+  `published` and `trusted`, and its message no longer suggests
+  `force_unverified`.
+
+### a tool that drifted from its pin disappears from the listing
+
+A pinned tool whose definition no longer matches its pin, under
+`digest_enforcement: block` (the default), used to stay in `tools/list` and
+`hangar_tools` and be refused when called with `Tool '<name>' schema does not
+match its pinned digest`. It is now withheld: it is not listed, and on the
+front door a call of it is answered `-32601 Tool '<name>' not found`, as for a
+tool that does not exist. `hangar_call` still answers `ToolDigestMismatchError`.
+
+What to do:
+
+- Anything that waited for the digest-mismatch refusal on the front door to
+  learn about drift should read `hangar_details <server>` (`withheld_tools`,
+  reason `digest_drift`), the `withheld` field on `GET /api/tools` and
+  `GET /api/mcp_servers/{id}/tools`, the `tool_digest_pin_drift_detected` log
+  line, or the `DigestMismatchEvent`. Both are emitted once when the drift is
+  first seen, whether or not the interval re-check is on.
+- REST no longer returns a withheld tool's description or input schema, to any
+  role: a withheld entry is its name, `digest`, `pinned_digest` and `withheld`
+  only. A tool withheld from any tenant, or by a pin on a group that owns the
+  server, is shown withheld there. Review the new definition at the upstream
+  itself before re-pinning; `mcp-hangar pin --check` shows both digests.
+- To bring the tool back after reviewing the change, re-pin it
+  (`mcp-hangar pin --write`) and reload; clients are sent
+  `notifications/tools/list_changed`.
+- A server pinned under `warn` or `audit` is unchanged: its drifted tools stay
+  listed and callable.
+
+### a pinned tool is served without its title, annotations, icons and `_meta`
+
+A tool under a digest pin in `block` mode (the default `digest_enforcement`)
+is now served with only `name`, `description`, `inputSchema` and
+`outputSchema`, the fields the pin covers. Its `title`, `annotations`,
+`execution`, `icons` and `_meta` are left out of the front door's
+`tools/list`, `server/discover`, `hangar_tools`, `hangar_details` and the REST
+server and tool routes. Hangar's own fields (`digest`, `pinned_digest`,
+`withheld`) are unchanged. The cut does not depend on where the fields came
+from: a `title` or `annotations` you wrote yourself for a server's predefined
+`tools` in the configuration is stripped too while the tool is under a `block`
+pin.
+
+What a client sees:
+
+- The display name falls back to `name`.
+- With no `annotations`, the spec's defaults apply: `readOnlyHint: false`,
+  `destructiveHint: true`, `idempotentHint: false`, `openWorldHint: true`. A
+  client that skipped confirmation for a pinned read-only tool will ask again.
+- `execution` is left out on every protocol version, but only a handshake-era
+  client (2025-11-25 and earlier) reads `execution.taskSupport` to decide
+  whether to call a tool as a task. Such a client no longer sees a pinned tool
+  that declared `taskSupport: "required"` as a task tool, and calls it without
+  one. On 2026-07-28, task use is negotiated through the tasks extension
+  instead.
+
+What to do:
+
+- Nothing, if the pinned tools' metadata is not load-bearing for your clients.
+- A tool left unpinned, or a server pinned with `digest_enforcement: warn` or
+  `audit`, is served whole as before. Both also give up the protection: an
+  unpinned tool is not checked, and `warn`/`audit` let a drifted call through.
+  A follow-up is planned to let a pin approve these fields explicitly.
+- The digest is unchanged: existing pins stay valid and need no `pin --write`.
+
+## Upgrade to 2.29.1
+
+### A failing `hangar_*` tool now returns `isError: true`
+
+The error payload every `hangar_*` tool returns on failure (`error`, `error_type`, `details`) used to arrive with `isError: false`. It now arrives with `isError: true`; the payload itself, in `structuredContent` or as the single JSON text block, is the same.
+
+A client that treated every `hangar_*` result as a success and looked for an `error` key still sees the key. A client that raises or retries on `isError` will now do so for these failures, which is the intent. Only the exact three-key payload of a `hangar_*` tool is flagged: a proxied backend tool's answer is never changed, and the few `hangar_*` tools that answer with a single-key `{"error": ...}` of their own (discovery and continuation when not configured) are not covered by this change.
+
+### `provider-admin` can now register, start, stop and remove servers
+
+The built-in `provider-admin` role held the pre-rename `provider:*` permissions, which no route or tool checks, so it could read servers and push egress policy but nothing else. It now holds `mcp_servers:write` and `mcp_servers:lifecycle`.
+
+Any API key or role assignment on `provider-admin` gains those four capabilities: `POST /api/mcp_servers`, `PUT` and `DELETE /api/mcp_servers/{id}`, and `start` and `stop`. It still has no `config:reload`, no `admin:*` and no access to the credential store. If a key must stay narrower, move it to `viewer`, or to `kubernetes-operator` for the Kubernetes operator.
+
+### Several pods sharing one `mcp-hangar.io/name` register as one server
+
+Pods that carry the same `mcp-hangar.io/name` annotation, which is every replica of a Deployment, used to be discovered as separate entries under one name. The gateway tracks a server by name, so they replaced each other each cycle and raised a config-change event per swap. Discovery now registers one pod per name, the one that sorts first by namespace and pod name, and logs `kubernetes_discovery_several_pods_for_one_name` listing the rest.
+
+This is not load balancing. For a workload with several replicas, put a Service in front, point the registration at it and give it its own name, instead of annotating the pods. The same name in two namespaces is treated the same way.
+
+### A misspelled `digest_enforcement` or a malformed `tool_projection` now refuses the configuration
+
+A server or group `tool_projection` block that is not a mapping, or whose `digest_enforcement` is not `audit`, `warn` or `block`, used to be ignored (the second with one log line) and the entry ran on the default mode. It is now a `ConfigurationError` naming the scope and the value: the gateway will not start with it, a reload leaves the running configuration untouched, and `mcp-hangar config check` reports it.
+
+Run `mcp-hangar config check` before upgrading. If it names an entry, correct the value; the entry was running on the default `block` mode all along.
+
+### List results carry their cache hints at the top level
+
+`tools/list`, `prompts/list`, `resources/list` and `resources/templates/list` no longer put `cacheScope` and `ttlMs` in `_meta`. They are top-level fields of the result (`"cacheScope": "private"`, `"ttlMs": 5000`), as the 2026-07-28 spec defines them. The `_meta.cacheScope` value was a per-tenant token (`tenant:<hash>`) and is no longer emitted.
+
+A client or proxy that read `_meta.cacheScope` or `_meta.ttlMs` from Hangar should read the top-level fields instead. Nothing else changes: every projected list is still per caller, which is what `"private"` says.
+
+### Governance extension identifiers use a slash
+
+The governance extensions are now named `io.mcp-hangar/validator`, `io.mcp-hangar/mutator` and `io.mcp-hangar/digest-pinning` (SEP-2133 form), in `interceptors/list` and in the capabilities. Where to look depends on the protocol era: `server/discover` (2026-07-28) carries them under `capabilities.extensions`; `initialize` carries them under `capabilities.experimental`.
+
+A client that looks the dotted names up (`io.mcp-hangar.validator`, and so on) keeps finding them in `capabilities.experimental` of `initialize` for this minor, marked `"deprecated": true` with `replacedBy`; `interceptors/invoke` also still accepts them. The modern `server/discover` surface never carried them under the old names, and the dotted aliases will be removed in the next minor. Switch the lookup to the slash form.
+
+### An upstream's failure result is relayed whole
+
+When an upstream answers a tool call with `isError: true`, a front-door `tools/call` now returns that result as sent (content blocks, `structuredContent`, `_meta`), instead of a result holding only the error text. A client that read nothing but the first text block keeps working. A `hangar_call` entry for the same call keeps `success: false`, `result: null` and `error`, and gains an `upstream_result` field with the upstream's whole answer; a client that rejects unknown fields in a batch entry should accept it.
+
+## Upgrade to 2.29.0
+
+### `/api/config/diff` and `/api/config/backup` refuse `config_path`
+
+Both routes now act on the file the gateway was started with and answer `422` to a request that names `config_path` (the `GET /api/config/diff` query parameter, the `POST /api/config/backup` body field), the way `/api/config/reload` has since 2.x. Drop the parameter from any script that sends it; if it pointed at the gateway's own file, nothing else changes. A gateway started with `--config X` now backs up and diffs `X` instead of `MCP_CONFIG` or `./config.yaml`.
+
+### `mcp-hangar add` keeps a prompted secret out of the config file
+
+A secret entered at the `add` prompt used to be written under the server's `env` in `config.yaml`. The file now holds `${NAME}` and the value is not stored anywhere: set that variable in the environment that starts Hangar (your shell profile, or the `env` block of the MCP client entry). A server added with an earlier version still has its plaintext value in the file; replace it with `${NAME}` and rotate the secret if the file was ever shared or committed. Configuration files created by `add` and `init` are now mode 0600; existing files are left as they are.
+
+### `oidc.clock_skew_leeway_seconds` now takes effect, and an invalid value refuses the configuration
+
+The key was ignored: the leeway was always 60 seconds. If your configuration sets it (top level or on an `oidc.issuers` entry), that value now applies, so a tighter value starts rejecting tokens that are further out of step with the issuer's clock than before. A value that is not a whole number from 0 to 300 (including a quoted number) now stops the gateway at boot or the reload with a message naming the key, where it was silently ignored. Remove the key to keep the default of 60.
+
+### Withdrawing or restoring a tool for every tenant needs the administrator's grant
+
+`POST /api/admin/tools/{server}/{tool}/withdraw` and `.../restore` with no `tenant_id` act on every tenant, and now answer `403` to a global `developer`; the `admin` role (or any grant holding `admin:*`) is required. Send the `tenant_id` to act on one tenant, which a global developer and a tenant-scoped developer can still do. If a script or an operator relied on a developer key for a fleet-wide withdrawal, give that key an administrator role or name the tenants.
+
+### `hangar_call(max_attempts=1)` disables the configured retries
+
+With a `retry:` block configured, `max_attempts=1` used to get the configured count anyway. It now means one attempt. A caller that passed `1` explicitly and relied on the configured retries (rather than omitting the argument) now gets a single attempt; omit `max_attempts` to keep the configured policy. The argument's default in the tool schema changes from `1` to `null`, which means "the configured policy". Nothing changes for a gateway without a `retry:` block.
+
+## Upgrade to 2.28.0
+
+### Subprocess `args` are now passed to the server
+
+For `mode: subprocess`, `args` is appended to `command`. Before, it was silently ignored, so a hand-written `args` on a subprocess server starts doing something. If you kept an `args` there that the server must not receive, remove it. `args` for `mode: docker` is unchanged.
+
+### `serve --http` binds 127.0.0.1 by default
+
+The default `--host` (and `MCP_HTTP_HOST`) changed from `0.0.0.0` to `127.0.0.1`. A gateway that relied on the default to be reachable from other hosts or containers must now say so: `--host 0.0.0.0` (or `MCP_HTTP_HOST=0.0.0.0`), which still requires authentication. The published image and the Helm chart already pass `--host` explicitly and are unaffected.
+
+### `add` and `init` lose seven registry entries and the `data` bundle
+
+The registry no longer offers `github`, `postgres`, `slack`, `puppeteer`, `brave-search`, `google-maps` and `sqlite`: their npm packages are unsupported or do not exist, so the configuration they wrote could not start. `init --bundle data` is gone (it was `filesystem`, `fetch`, `memory`, `sqlite` and `postgres`); `developer` is now `filesystem`, `fetch`, `memory` and `git`. A `config.yaml` that already names one of these servers is not touched; to keep it, point its `command` at a maintained server of your choice. `fetch` and `git` now need `uvx`, since their npm names do not exist.
+
+### `max_consecutive_failures` must be 1 to 100
+
+A server whose `max_consecutive_failures` is 0, above 100, or not an integer now refuses the config instead of booting. Set it inside 1-100 (the default is 3) before upgrading; `mcp-hangar config check` does not flag it, so look for it with `grep -rn max_consecutive_failures`.
+
+### `IRoleStore` requires `list_principals()`
+
+A custom role store (a class implementing `IRoleStore` outside this package) must now implement `list_principals() -> list[dict]`, returning one `{"principal_id": ..., "roles": [...]}` per principal that holds a role. The four stores that ship with Hangar already do. Without it the store cannot be instantiated.
+
+### Registering a discovery source over REST now builds it
+
+`POST /api/discovery/sources` used to store the specification and run nothing. It now builds the source and starts it, which changes three answers: an unknown or unavailable `source_type` is refused with 422 (it was accepted and ignored); a type the gateway already holds, from the config or an earlier call, is refused with 422 (the orchestrator keeps one source per type; update it with `PUT`); and the returned `source_id` is the id `GET /api/discovery/sources` shows. Source registration needs the `discovery:approve` permission, as before. Check any automation that posted sources the gateway silently ignored: they begin to run.
+
+### `GET /api/tools` returns `input_schema` as an object
+
+`input_schema` was a string holding a Python repr (`"{'type': 'object'}"`). It is now the JSON object itself, and `{}` when a tool declares none. A client that parsed the string must read the field directly.
+
+### Docker-discovered http servers default to the path `/mcp`
+
+The endpoint of a container discovered in `http` or `sse` mode is now `http://host:port/mcp`; it was `http://host:port`. A container that serves MCP at the root, or elsewhere, must say so with the label `mcp.hangar.path` (for example `mcp.hangar.path: "/"`). Kubernetes discovery already behaved this way.
+
+### The negotiated `interceptors/list` shape returns the reverse-DNS interceptor ids
+
+With the `MCP-Interceptor-Ext: io.modelcontextprotocol/interceptors` header, `interceptors/list` now answers `io.mcp-hangar.validator` and `io.mcp-hangar.mutator`, as the default shape already did, instead of `mcp-hangar-validator` and `mcp-hangar-mutator`. A client that keyed on the old names reads the new ones. `interceptor/invoke` still accepts the old names but its answer, and the `InterceptorInvoked` event, carry the new id.
+
+### `GET /api/auth/keys` requires `principal_id`
+
+A request without `principal_id` (or with a blank one) now gets HTTP 400 instead of 200 with an empty list. Pass the principal whose keys you want.
+
+### Config reload with auth off is recorded as `anonymous`
+
+`POST /api/config/reload` with authentication disabled recorded `requested_by="api"`; it now records `anonymous`, the same value the auth routes use. If you filter the audit trail or logs on `requested_by="api"`, match `anonymous` as well. With auth on, the caller's principal id is recorded as before.
+
+### `MCP_COMPLIANCE_OUTPUT` without `MCP_COMPLIANCE_FORMAT` refuses startup
+
+A gateway with `MCP_COMPLIANCE_OUTPUT` set and `MCP_COMPLIANCE_FORMAT` unset used to start with no SIEM export at all. It now refuses to start. Set `MCP_COMPLIANCE_FORMAT` (`cef`, `leef`, `jsonlines` or `syslog`) to export to that path, or unset `MCP_COMPLIANCE_OUTPUT` if you meant no export.
+
+### `init` keeps its client-config backup in the state directory
+
+`mcp-hangar init` no longer writes `<name>.backup.<timestamp>.json` next to each client config it changes (including `./.mcp.json` and `./.cursor/mcp.json` in your project). It saves the first, pre-Hangar copy under `$XDG_STATE_HOME/mcp-hangar/init-backups` (`~/.local/state/mcp-hangar/init-backups`) and records it in `init-manifest.json` there; a re-run keeps that first copy. `mcp-hangar init --undo` restores from it. Backups earlier versions left beside your files are not touched or tracked; delete them if you no longer need them, and add `*.backup.*.json` to your ignore file only if you want to keep them out of version control.
+
+### Bind existing pins to their upstream
+
+Pins you already have keep working and check the tool definition only. To have them also refuse a server that points at a different upstream, run `mcp-hangar pin --write` once: it adds `tool_projection.upstream` to each pinned server. A subprocess server's identity includes a hash of its command line, so changing the command (a new package version in `npx` arguments, for example) is a new upstream and the pins need `pin --write` again. A remote server's identity is its origin (scheme, host, port), so a path change does not matter.
+
+## Upgrade to 2.27.5
+
+### `init` writes absolute paths; state follows a configured `event_store.path`
+
+When `event_store.path` is absolute, the saga state file (`saga_state.db`) and the approvals database (`mcp_hangar.db`) now live in the same directory as the event store instead of in `data/` under the working directory. Configurations without an absolute `event_store.path` are unchanged.
+
+Entries written by an earlier `mcp-hangar init` use a bare `mcp-hangar` command and a relative `data/` path, which fails when the client spawns Hangar with a minimal `PATH` or an unwritable working directory. Rerun `mcp-hangar init` to refresh them. If you move to the new location, copy any existing `data/*.db` files next to the new `event_store.path` first.
+
+### The MCP SDK is 2.3.0
+
+`mcp-hangar` now requires `mcp==2.3.0` and `mcp-types==2.3.0`; it was 2.0.0 for
+both. Both stay pinned exactly. Nothing in the configuration changes.
+
+- A project that pins `mcp` itself, or installs `mcp-hangar` beside a package
+  that does, needs `mcp==2.3.0`.
+- The SDK's own defaults changed with it: a 4 MiB request-body limit, a
+  30-minute idle expiry and a cap of 10,000 stateful sessions. Hangar does not
+  override them.
+- `Mcp-Param-*` headers of projected tools are still checked against a call's
+  arguments. 2.3.0 stopped checking them for any tool the SDK had not registered
+  itself. Hangar answers for its own tools since 2.27.4, which this release
+  includes.
+
+## Upgrade to 2.27.4
+
+### An access policy with a key nothing reads refuses the configuration
+
+A policy block may carry only `allow_list`, `deny_list`, `approval_list`,
+`approval_timeout_seconds` and `approval_channel` (and `access` in a
+`tool_access.member.<tenant>` entry). Any other key now refuses startup and a
+reload, naming the path and the key. Before, such a block was read as no policy
+at all, so the tools it meant to restrict were served.
+
+- **If you wrote `tools: {allow: [...], deny: [...]}`**, as the README did: you
+  have had no restriction. Rename the keys to `allow_list` and `deny_list`, and
+  check what the gateway served in the meantime.
+- Run `mcp-hangar config check <file>` before upgrading: it reports the same
+  keys and exits 1.
+- A reload that hits this keeps the policy that was in force.
+
+## Upgrade to 2.27.0
+
+### Trusting private networks for servers registered over the API
+
+`POST /api/mcp_servers` still refuses every private endpoint by default. To let
+the Kubernetes operator register a server it runs in the cluster, list the
+cluster's Service range in `config.yaml`:
+
+```yaml
+ssrf:
+  trusted_networks: ["10.96.0.0/12"]
+```
+
+- The list applies to every caller allowed to register a server, not only the
+  operator. Keep it as narrow as the servers need.
+- The Service range also holds the kube-apiserver's ClusterIP and every other
+  Service in the cluster. Add the pod range only for headless Services.
+- Loopback, link-local (including the cloud metadata endpoint) and the
+  unspecified ranges are refused at startup and on reload. So is a CIDR with
+  host bits set.
+
+## Upgrade to 2.26.0
+
+### deleting a configured server over the API is refused
+
+`DELETE /api/mcp_servers/{id}` on a server that the configuration file declares now answers `409` with `"error": "declared_in_config"`. The server keeps running. Before, the delete stopped it and removed it from the pool, and the next reload or restart brought it back.
+
+- To remove a configured server, delete it from the configuration and reload.
+- To take it out of service for a while, stop it instead of deleting it.
+
+Servers added with `POST /api/mcp_servers`, and servers that discovery registers, are deleted as before.
+
+The Kubernetes operator sent this delete whenever an MCPServer CR was deleted, including a CR that mirrored a configured server. Operator versions that include mcp-hangar/mcp-hangar-operator#202 no longer do.
+
+## Upgrade to 2.25.0
+
+### An invalid access policy refuses the configuration
+
+A `tools:` access policy (`allow_list` / `deny_list` / `approval_list`) on a
+server, a group, a group member or a `tool_access.member` tenant entry, and an
+`access:` block, is now refused when one of its fields is invalid: an
+`approval_timeout_seconds` that is not a positive integer, an empty or
+non-string pattern, a whitespace-only `approval_channel`, or a list given as a
+number.
+
+Before, the gateway logged `invalid_tools_access_config` (or the group, member,
+tenant or `access` variant) at warning and booted with **no policy** for that
+scope. Now the boot fails, and a reload is refused with the previous policy kept
+in force, with a `ConfigurationError` naming the scope and the field, for
+example:
+
+```text
+Invalid tools access policy for mcp_server 'calc': Invalid approval_timeout_seconds: 0
+```
+
+A configuration that booted with one of those warnings in its log will not boot
+on this release. Fix the field the error names. A policy you meant to have no
+effect is removed by deleting the block, not by leaving it invalid.
+
+### The actor of an auth mutation is the caller; `*_by` body fields are refused
+
+The auth REST routes used to accept the actor of a change in the request body:
+`created_by` on `POST /api/auth/keys` and `POST /api/auth/roles`, `revoked_by` on
+`DELETE /api/auth/keys/{key_id}` and `DELETE /api/auth/roles/revoke`,
+`assigned_by` on `POST /api/auth/roles/assign`, and `updated_by` on
+`PATCH /api/auth/roles/{role_name}`. Each was optional and defaulted to
+`"system"`, and whatever it said was recorded in the domain event, the log line
+and the response.
+
+The actor is now always the principal that authenticated the request. A body
+that still carries one of those fields -- whatever its value, including `null`
+or the caller's own id -- is refused with `422` and a `ValidationError` naming
+the field, and nothing is changed. `DELETE /api/auth/roles/{role_name}` records
+the caller as `deleted_by` instead of `"system"`, and `POST /api/auth/keys`
+returns `created_by` alongside the key.
+
+Old:
+
+```json
+{"principal_id": "user:bob", "role_name": "developer", "assigned_by": "user:alice"}
+```
+
+New -- drop the field; the assigner is whoever the key or token belongs to:
+
+```json
+{"principal_id": "user:bob", "role_name": "developer"}
+```
+
+A script or client that sent these fields must stop sending them. With auth
+disabled no principal is attached to a request, and the actor is recorded as
+`anonymous`, never `system`; in practice the key and role routes have no store
+to write to with auth off, so this only names the value should one be wired.
+
+### A missing configuration file stops the gateway
+
+There is no built-in demo configuration any more. Before, when the
+configuration file was not there, Hangar logged `config_not_found_using_default`
+at INFO and booted a `math_subprocess` backend with every `hangar_*` tool --
+stop, load and `reload_config` included -- and none of your pins, policies or
+auth. That happened for a mistyped `--config`, an `MCP_CONFIG` naming a missing
+file, a `config_path` given to `bootstrap()` or `Hangar.from_config()`, and a
+start with no configuration file anywhere.
+
+Now each of those refuses to start. `mcp-hangar serve`, a bare `mcp-hangar` and
+`python -m mcp_hangar.server` exit 1 with the path and where it came from on
+stderr, for example:
+
+```text
+Error: Configuration file /etc/hangar/confg.yaml (named on the command line) does not exist. Nothing is served without the configuration that was asked for.
+```
+
+`bootstrap()` and `Hangar.start()` raise `MissingConfigFileError` (a
+`ConfigurationError`). A path that is a directory or is not readable is refused
+the same way.
+
+With no flag, no `MCP_CONFIG`, no `./config.yaml` and no
+`~/.config/mcp-hangar/config.yaml`, the message says to run `mcp-hangar init`.
+
+What to do: if a deployment logged `config_not_found_using_default`, it was
+running the demo configuration. Fix the path, or create the file with
+`mcp-hangar init`. For a gateway with no servers, use a file holding
+`mcp_servers: {}`. From Python, a
+configuration with no file goes in `bootstrap(config_dict=...)` or `Hangar.from_builder(...)`.
+
+### Every command reads the configuration file by one rule
+
+`init`, `status`, `add`, `remove`, `pin`, `serve`, a bare `mcp-hangar`,
+`config check` and `python -m mcp_hangar.server` now resolve the configuration
+file the same way, highest first:
+
+1. a path on the command line -- the command's own flag or argument, then the
+   global `--config`;
+2. `$MCP_CONFIG`;
+3. `./config.yaml`, if the working directory has one;
+4. `~/.config/mcp-hangar/config.yaml`, the file `init` writes.
+
+What changes for you:
+
+- **`serve` with no flag, no `MCP_CONFIG` and no `./config.yaml`** used to boot
+  the built-in demo config. It now reads `~/.config/mcp-hangar/config.yaml` if
+  `init` wrote one, and refuses to start if there is none (see "A missing
+  configuration file stops the gateway"). A `./config.yaml` beside the process still wins, so a setup
+  that ran `serve` next to its file is unchanged, and so is the container image
+  (its working directory is `/app`).
+- **`init`, `add`, `remove` and `status` in a directory with a
+  `./config.yaml`** used to write or report `~/.config/mcp-hangar/config.yaml`.
+  They now use `./config.yaml`, the file `serve` there reads. `init -y` backs
+  that file up and replaces it, and `add` and `remove` edit it in place -- so
+  run them in a directory whose `config.yaml` is Hangar's, or pass
+  `--config ~/.config/mcp-hangar/config.yaml` (or `init --config-path`) to keep
+  the old target.
+- **`status` with a named file that does not exist** used to report whichever
+  default file it found next. It now reports that no configuration was found at
+  the named path.
+- **`MCP_CONFIG` no longer outranks a global `--config`.**
+  `MCP_CONFIG=a.yaml mcp-hangar --config b.yaml serve` used to run `a.yaml`,
+  because `serve`'s own `--config` read the variable. It now runs `b.yaml`.
+- **`pin` and `config check` honour the global `--config`.**
+  `mcp-hangar --config X pin --check` used to exit 2 looking for
+  `./config.yaml`; it now checks `X`.
+- **Reload works on a gateway started without `--config`.** The watcher,
+  SIGHUP, the reload tool and `POST /api/config/reload` used to fail with "No
+  configuration path specified"; they now reload the file the gateway booted
+  from.
+
+### The Langfuse adapter and its settings are removed: send spans to Langfuse over OTLP
+
+Nothing called the Langfuse adapter after 2.22.0, so these settings sent
+nothing to Langfuse. They are removed:
+
+- `observability.langfuse` in `config.yaml` (`enabled`, `public_key`,
+  `secret_key`, `host`, `sample_rate`, `scrub_inputs`, `scrub_outputs`)
+- `MCP_LANGFUSE_ENABLED`, `MCP_LANGFUSE_SAMPLE_RATE`,
+  `MCP_LANGFUSE_SCRUB_INPUTS`, `MCP_LANGFUSE_SCRUB_OUTPUTS`
+- `HANGAR_LANGFUSE_ENABLED`, `HANGAR_LANGFUSE_SAMPLE_RATE`,
+  `HANGAR_LANGFUSE_SCRUB_INPUTS`, `HANGAR_LANGFUSE_SCRUB_OUTPUTS`
+- the `langfuse` extra (`pip install mcp-hangar[langfuse]`)
+- in Python, `create_runtime(observability_config=...)`,
+  `Runtime.observability`, `Runtime.observability_config`,
+  `mcp_hangar.bootstrap.runtime.ObservabilityConfig`, the
+  `mcp_hangar.integrations` package, `ApplicationContext.observability_adapter`;
+  `init_observability()` now returns only the parsed config, and
+  `shutdown_observability()` takes no argument
+
+What happens to a configuration that still sets them:
+
+- A scrub setting (`MCP_LANGFUSE_SCRUB_*`, `HANGAR_LANGFUSE_SCRUB_*`, or
+  `observability.langfuse.scrub_*`), whatever its value, **refuses the boot**
+  with a `ConfigurationError` naming it. Before, it was accepted and did
+  nothing. Delete it. Hangar's spans carry no tool arguments or results; to
+  redact what they do carry, put an OpenTelemetry Collector with an
+  `attributes` or `redaction` processor in front of Langfuse.
+- The other environment variables are named in a `langfuse_settings_removed`
+  warning, and the boot continues.
+- The rest of an `observability.langfuse` block is named as removed by the
+  unknown-key check: a warning, or a refusal under `HANGAR_CONFIG_STRICT` and
+  in `mcp-hangar config check`.
+
+`LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and `LANGFUSE_HOST` are the
+Langfuse SDK's own variables and are left alone.
+
+To send Hangar's spans to Langfuse, use the OTLP exporter (Langfuse accepts
+OTLP over HTTP, not gRPC):
+
+```sh
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://cloud.langfuse.com/api/public/otel/v1/traces
+export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_TRACES_HEADERS="Authorization=Basic%20<base64 of public_key:secret_key>,x-langfuse-ingestion-version=4"
+```
+
+Use the `TRACES_` variables: the generic `OTEL_EXPORTER_OTLP_ENDPOINT` also
+turns on OTLP audit log export, which Langfuse does not accept. The full recipe
+is `examples/langfuse/README.md`.
+
+### A pinned server's catalogue is re-listed every 60 seconds
+
+Before, the catalogue a digest pin is checked against was refreshed only when a
+server started and when its upstream sent `tools/list_changed`. An upstream
+that changed a pinned tool's schema without announcing it was served under the
+old pin until the gateway restarted.
+
+Now every READY server that a pin covers -- a `tool_projection.pins` or
+`tenant_overrides.<tenant>.pins` entry on the server itself or on a group it is
+a member of -- is re-listed on an interval, set by a new top-level key:
+
+```yaml
+tool_projection:
+  pin_recheck_interval_s: 60   # the default; 0 turns the re-check off
+```
+
+A non-zero value must be between 5 and 3600; anything else, a string or a
+boolean included, refuses the boot. The value is read at start, so a reload
+does not change it. Servers that are `cold`, starting, degraded or DEAD are
+not listed and not started.
+
+What to expect:
+
+- A drifted pinned tool is refused (`ToolDigestMismatchError`, gate reason
+  `digest_mismatch`) at most one interval, plus the time the pass takes, after
+  the upstream changed it. The `tool_digest_pin_drift_detected` warning and one
+  `DigestMismatchEvent` are emitted when the pass first sees it.
+- One `tools/list` request per pinned server per interval reaches its
+  upstream, from every replica.
+- A re-list also refreshes the rest of the catalogue. A tool the upstream added
+  without announcing it is now seen within one interval as well. On a pinned
+  server whose `capabilities` enforcement blocks or quarantines a tool outside
+  `expected_tools`, that server is now blocked at its next call instead of
+  running on until a restart.
+
+### A SIEM export the gateway cannot perform refuses startup
+
+Before, an unknown `MCP_COMPLIANCE_FORMAT` logged `unknown_compliance_format`
+at warning and the gateway started with **no export**. An
+`MCP_COMPLIANCE_OUTPUT` whose directory did not exist, or could not be written,
+started too, and every record was logged as an error and dropped.
+
+Now each refuses the boot with a `ConfigurationError` naming the value:
+
+```text
+Unknown MCP_COMPLIANCE_FORMAT 'cefx'; expected one of: cef, json-lines, jsonlines, leef, syslog
+MCP_COMPLIANCE_OUTPUT '/var/log/hangar/audit.cef' cannot be appended to: [Errno 2] No such file or directory: ...
+```
+
+So does a set `MCP_COMPLIANCE_FORMAT` whose exporter cannot be imported, which
+used to log `compliance_exporter_unavailable` and start without export. The
+format is now matched after trimming whitespace, so `" cef"` is read as `cef`.
+
+A deployment that started with one of those in its log will not start on this
+release. Fix the format, create the output directory writable by the gateway's
+user, or unset `MCP_COMPLIANCE_OUTPUT` to export to stderr. To run with no SIEM
+export, unset `MCP_COMPLIANCE_FORMAT`.
+
+A write that fails after startup does not stop the gateway or refuse calls. It
+is counted in `mcp_hangar_compliance_export_failures_total` (labels `format`
+and `reason`), and `/health/ready` and `hangar_health` carry a
+`compliance_export` field whose `status` is `degraded` until a write succeeds
+again; `/health/ready` keeps answering 200. Alert on the counter.
+
+### Approving a held call whose batch was cancelled is refused with 409
+
+When a call is held for approval and its `hangar_call` batch deadline passes
+before anyone answers, the call will not run. Before, approving it afterwards
+answered `200` with `state: "approved"`, the record said `approved`, and
+`ToolApprovalGranted` was published naming the approver in `decided_by`.
+
+Now `POST /api/approvals/{id}/resolve` with `"decision": "approve"` answers
+`409`:
+
+```json
+{"error": "Approval refused: the held call was cancelled and did not run", "state": "cancelled"}
+```
+
+The approval record moves to a new terminal state, `cancelled`
+(`GET /api/approvals?state=cancelled` lists them), and the gate publishes
+`ToolApprovalCancelled`, whose `attempted_by` names the approver, instead of
+`ToolApprovalGranted`. The `mcp_hangar_approval_decisions` counter gains the
+`decision="cancelled"` value. On a `cancelled` record, `decided_by` names who
+tried to approve the call, not who let it through: nothing did.
+
+A denial after the deadline is still recorded as a denial, and an unanswered
+hold still expires. An approval tool or dashboard that treats every `409` from
+resolve as "already resolved" should read `state`; an audit consumer that
+enumerates approval events or states should add the new ones. An approval that
+lands on a different gateway instance than the held call still answers `200`
+there; the instance holding the call records it `cancelled` and publishes
+`ToolApprovalCancelled`, not a grant.
+
+### A tool access list written as a string or a mapping refuses the configuration
+
+`allow_list`, `deny_list` and `approval_list` in a `tools:` policy (on a
+server, a group, a group member or a `tool_access.member` tenant entry) and in
+an `access:` block must now be lists.
+
+Before, a string was split into its characters and a mapping was read as its
+keys, and the gateway booted. `deny_list: add` became the patterns `a`, `d`,
+`d`, so `add` was **allowed**. Now the boot fails, and a reload is refused with
+the previous policy kept in force, with a `ConfigurationError` naming the scope
+and the field, for example:
+
+```text
+Invalid tools access policy for mcp_server 'calc': Invalid deny_list: expected a list of patterns, got str 'add'
+```
+
+Old form:
+
+```yaml
+tools:
+  deny_list: add
+```
+
+New form:
+
+```yaml
+tools:
+  deny_list: [add]
+```
+
+A configuration that used the old form booted with a different policy from
+the one written; it will not boot on this release until the list is fixed.
+`hangar_load` now refuses a policy that fails to parse (an empty pattern in
+`allow_tools`, `deny_tools` or `approval_tools`, or a value that is not a list)
+before anything is installed. It used to install and start the server first,
+and leave it loaded with no policy.
+
+### A tool access policy block that is not a mapping refuses the configuration
+
+A policy block that is present must now be a mapping. This covers `tools:` on a
+server, a group or a group member, `access:` and each `access.<kind>`, and
+`tool_access:`, `tool_access.member` and each `tool_access.member.<tenant>`
+entry on a server. On a server, and on a group member that defines its server
+inline, `tools:` may still be a list of tool schemas, and each item must be a
+mapping.
+
+Before, a block of any other shape was skipped and the gateway booted with no
+policy for that scope: `tools: add` left every tool allowed. A key with no value
+(YAML null) was skipped the same way. Now the boot fails, and a reload is
+refused with the previous policy kept in force, with a `ConfigurationError`
+naming the scope, for example:
+
+```text
+Invalid tools access policy for group 'pool': expected a mapping, got str 'add'
+```
+
+Old form:
+
+```yaml
+tools: add
+access:
+  prompt:
+```
+
+New form:
+
+```yaml
+tools:
+  deny_list: [add]
+# or remove the key, or write `access: {}` / `prompt: {}` for no policy
+```
+
+`tools: [add]` on a server was read as a tool schema list and stopped the boot
+with an `AttributeError`; it is now a `ConfigurationError` that says a policy is
+a mapping. A list under `tools:` on a group, or on a member that names a server
+declared under `mcp_servers`, used to be ignored and is now refused.
+`hangar_load` takes no policy block, only the `allow_tools`, `deny_tools` and
+`approval_tools` lists, which #1718 already refuses when they are not lists.
+
+## Upgrade to 2.24.0
+
+### `mcp.server.id` names the group on every span of a group call; the member is `hangar.route.backend`
+
+`mcp_server.cold_start` and `command.send.InvokeToolCommand` used to carry the
+selected group member in `mcp.server.id`, while every other span of the same
+call carried the group. They now carry the group too, and the member moves to
+`hangar.route.backend`.
+
+A trace query, dashboard or alert that selects those spans by member, such as
+`name = "command.send.InvokeToolCommand" AND mcp.server.id = "<member>"`, finds
+nothing after the upgrade for calls routed through a group. Change it to
+`hangar.route.backend = "<member>"`. A query by group keeps working and now
+matches those spans as well. Calls to a server outside any group carry the same
+value in both keys, so their queries need no change.
+
+The lifecycle spans `mcp_server.launch` and `mcp_server.startup_wait` are not
+opened by the call, and keep naming the member they start in `mcp.server.id`,
+so a query over every span of a group call's trace still sees the member there.
+
+### An L7 refusal logs bounded verdict fields, and an uninspectable call is an error trace
+
+`batch_call_refused` for an L7 egress refusal (`error_type` `EgressPolicyDeniedError` or
+`EgressPolicyApprovalRequiredError`) no longer carries `reason`, which held the policy's
+reasons joined into one free-text string, such as `tool 'x' matched a deny rule`. It
+carries `l7_verdict` (`deny` or `require_approval`), `l7_mode` (`enforce`), `l7_rule_kind`
+(`tool`, `argument` or `header`) and `l7_inspection_failed`, next to the `policy_id` it
+already had. A log query or alert matching text in `reason` for these lines has to move
+to those fields. The reasons themselves are still in the `egress_policy_enforced` warning
+and in the `EgressPolicyEnforced` event.
+
+A call the policy refused because it could not inspect the arguments (they could not be
+serialized, or the inspection raised) is now `hangar.call.outcome=error` and ends
+`batch.call.<tool>` ERROR, where it used to read `deny` and UNSET: the verdict is a
+denial, but the evaluator broke. Its log line is `batch_call_failed` at warning with
+`l7_inspection_failed=true`, not `batch_call_refused`. The spans inside the call stay
+UNSET. The caller is refused exactly as before. In Audit mode nothing changes on the span;
+the `egress_policy_violation_observed` warning carries `inspection_failed`.
+
+### GET /mcp: a list_changed stream on a front door, 405 in egress
+
+On the handshake era (2025-11-25 and earlier), `GET /mcp` used to open an
+empty SSE stream that nothing wrote to. It stayed open until the client left.
+It now does one of two things:
+
+- On a `front_door` gateway, it is the stream that carries
+  `notifications/tools/list_changed`, and `initialize` answers
+  `tools.listChanged: true`. A client that re-lists on the notification now
+  sees upstreams that arrive after it connected, without reconnecting.
+- In `egress`, it answers `405 Method Not Allowed`. MCP clients treat a 405 on
+  this GET as "no stream offered".
+
+A proxy in front of the gateway should pass `text/event-stream` responses
+unbuffered and allow an idle interval longer than 15 s, the ping interval.
+On each replica, one principal may hold 32 open streams and one tenant 256. A
+client past either gets 429 on the GET, while its POSTs are unaffected.
+
+A stream ends when its principal's API key or a role is revoked, when a JWT's
+`exp` passes, and after an hour at the latest. The client then reconnects and
+authenticates again. A stream is told about the catalogue of the replica it is
+connected to (#877).
+
+To confirm that streams get through a proxy, watch
+`mcp_hangar_tool_list_changed_streams` (open streams per replica) and
+`mcp_hangar_tool_list_changed_notifications_total{transport="http"}`. A cap
+being hit shows in `mcp_hangar_tool_list_changed_streams_refused_total{reason}`.
+
+### caller user, agent and session ids are off spans unless `observability.tracing.caller_ids` is on
+
+Since 2.22.0 every `batch.call.<tool>` span carried `mcp.caller.id`,
+`mcp.user.id`, `mcp.agent.id` and `mcp.session.id` for an authenticated caller.
+They are now left off by default, as the telemetry data contract requires.
+`mcp.caller.type`, `mcp.caller.tenant_id` and `mcp.correlation_id` are still set.
+The attribute names are unchanged: only whether they are emitted changed.
+
+A dashboard, alert or trace query that selects spans by `mcp.caller.id` or
+`mcp.user.id` finds nothing after the upgrade. Either move it to OTLP audit
+records, which carry caller identity whatever this setting says, or turn the ids
+back on:
+
+```yaml
+observability:
+  tracing:
+    caller_ids: true
+```
+
+`MCP_TRACING_CALLER_IDS=true` does the same, and wins over the file.
+
+### `batch_call_refused` from a gate no longer carries `error`
+
+Since 2.22.0 a call refused by a batch gate logged `batch_call_refused` with an
+`error` field holding the message the caller was told, which could be an
+approver's own reason. That field is gone. A log query or alert that matches on
+the text of `error` in these lines finds nothing after the upgrade: match on
+`reason` (a bounded code such as `approval_denied` or `tool_withdrawn`), `gate`
+or `error_type` instead, which are unchanged. The refusal message still reaches
+the caller in the tool result, and approval decisions keep their reason in the
+event store.
+
+### Audit and compliance feeds now include refused tool calls
+
+A tool call a gate, the `tool:invoke` check or an L7 policy refuses now produces
+a `tool_invocation` audit record with `mcp.tool.status=denied`, where it
+produced none before. The compliance exporters write it under a new event type,
+`ToolInvocationDenied`: CEF signature `103` ("Tool Invocation Denied", severity
+5), LEEF event id `103`, syslog MSGID `103` at warning, and
+`"event_type": "ToolInvocationDenied"` in JSON lines. Nothing is removed or
+renamed. A SIEM rule, parser or dashboard that counts every `tool_invocation`
+record as a call that ran, or that keys on the known event types, should filter
+on the status or add the new type. The refusal's reason is in the bounded fields
+`gate` and `gateReason` (`gate_reason` in JSON lines), or `l7Verdict`, `l7Mode`,
+`l7RuleKind` and `l7PolicyId` for an L7 refusal.
+
+### A group call's audit record names the group in `mcp.server.id`; the member is `hangar.route.backend`
+
+The `tool_invocation` audit record of a call routed through a server group used
+to carry the selected member in `mcp.server.id`. It now carries the group the
+caller named, the same value its spans carry since #1286, and the member moves to
+`hangar.route.backend`.
+
+An audit query, dashboard or alert that selects group calls by member finds
+nothing after the upgrade. Change it:
+
+- Old: `mcp.event.name = "tool_invocation" AND mcp.server.id = "<member>"`
+- New: `mcp.event.name = "tool_invocation" AND hangar.route.backend = "<member>"`
+
+A query by group, `mcp.server.id = "<group>"`, used to need the group's
+membership at the time of each call and now matches directly. Calls to a server
+outside any group carry the same value in both keys, so their queries need no
+change.
+
+The compliance exporters follow the same rule. For a group call, the server
+field now names the group: CEF `cs1` (`cs1Label=ProviderID`), LEEF `src`, syslog
+`provider` and JSON lines `provider_id`. The member moves to a new field: CEF
+`flexString1` (`flexString1Label=RouteBackend`), LEEF `routeBackend`, syslog
+`routeBackend` and JSON lines `route_backend`. A SIEM rule that matched the
+member in the server field, such as CEF `cs1=<member>`, should match
+`flexString1=<member>` instead.
+
+Records written before the upgrade are not rewritten. Replayed events from
+before it carry no group, so their records fall back to the member in both keys.
+
+### L7 header rules no longer match on `hangar_call`
+
+An `MCPEgressPolicy` header rule (`headers.allow`, `headers.deny` or
+`headers.requireApproval`) is no longer consulted for a call made through
+`hangar_call`. That surface declares no `x-mcp-header`, so the SDK checks none of
+its `Mcp-Param-*` headers against the body, and ADR-025 says a selector must not
+match a header nothing checked. The call is decided by the policy's tool rules and
+its `defaultAction`, and the verdict's reasons include "header rules not
+consulted". A policy that relied on a header `allow` rule to let a `hangar_call`
+through a tool-name default-deny now denies it.
+
+The same holds on the front door for an `Mcp-Param-*` header the called tool does
+not declare: only declared headers are matched.
+
+To select on a header, call the tool on the front door (`tool_access.mode:
+front_door`) with the tool declaring the header through `x-mcp-header` on the
+argument it mirrors. That header is checked against the body before dispatch and
+still matches. Otherwise, express the rule as a tool-name rule.
+
+### `headers.param_validation.required` now refuses `hangar_call` with `Mcp-Param-*` headers
+
+With `headers.param_validation.required: true`, a `hangar_call` request on a
+modern protocol version that carries any `Mcp-Param-*` header is now refused
+with `HEADER_MISMATCH` (-32020) and the message "the request's Mcp-Param-*
+headers could not be validated against its body". Before, it was served.
+`hangar_call` declares no `x-mcp-header`, so none of its `Mcp-Param-*` headers
+is ever checked against the body, and none reaches an L7 selector either.
+
+The same refusal now applies on the front door to a call carrying an
+`Mcp-Param-*` header the called tool does not declare, next to a declared one.
+Before, only a failed pre-dispatch listing was refused.
+
+A request with no `Mcp-Param-*` header is not affected, and neither is any
+deployment that leaves `required` at its default, `false`. A handshake-era
+(legacy protocol version) call is not refused either, on the front door or on
+`hangar_call`: its client does not validate headers, by design, so its
+`Mcp-Param-*` headers are ignored and never reach an L7 selector.
+
+To keep a modern call working under `required`, stop sending `Mcp-Param-*`
+headers on `hangar_call`, or call the tool on the front door with the tool
+declaring the header through `x-mcp-header`.
+
+### An upstream response over the size limit fails the call instead of coming back dropped
+
+Until this release a `hangar_call` result over 10 MB (10 485 760 bytes) was
+read whole, then dropped: its entry came back with `success: true`,
+`result: null`, `truncated: true`, `truncated_reason: "response_size_exceeded"`
+and `original_size_bytes`, the trace carried a `hangar.shaping.drop` event and
+`mcp_hangar_batch_truncations_total{reason="per_call"}` went up. A flat call and
+the facade's `invoke` were not cut.
+
+The limit is now enforced while the upstream response is read, over stdio and
+HTTP, for every surface, and its default is 32 MiB (33 554 432 bytes). A
+response over it is not read to the end, and the call fails with
+`error_type: ResponseTooLarge` and the message `The upstream response exceeded
+the limit of <n> bytes and was not read.`, the same on `hangar_call`, on a flat
+call (a tool error, `isError: true`) and on the facade. The call span ends in
+ERROR with `error.type=ResponseTooLarge`. Nothing that was served before is
+refused at the default, since every response under 10 MB is under 32 MiB.
+
+- A client or alert that looked for `truncated_reason: "response_size_exceeded"`
+  should look for `error_type: "ResponseTooLarge"` instead. The
+  `reason="per_call"` series of `mcp_hangar_batch_truncations_total` is no
+  longer written; `reason="batch_budget"` is unchanged, and so is batch
+  truncation, with its continuation.
+- To change the limit, set `execution.max_response_bytes` in the config file,
+  or `MCP_MAX_RESPONSE_BYTES` in the environment, which wins over the file. A
+  server can set its own `max_response_bytes` in its `mcp_servers` entry, which
+  wins over both. Each must be a positive whole number of bytes; any other value
+  refuses the config.
+
+### A front-door caller without `tool:invoke` can no longer call upstream tools
+
+With auth on, the front door's flat `tools/call` now requires the `tool:invoke`
+permission, as `hangar_call` has since #389. A principal whose roles lack it,
+such as one holding only `viewer`, gets a tool error
+(`Not authorized to invoke tool '<tool>': tool:invoke permission required`)
+where it used to be served. An unauthenticated or anonymous caller is refused
+as `Authentication required to invoke tools`.
+
+Grant a role that holds `tool:invoke` (`developer`, `service-account`,
+`admin`) to every principal that calls tools through a front door, for
+example in `auth.role_assignments`:
+
+```yaml
+auth:
+  role_assignments:
+    - principal: "group:agents"
+      role: service-account
+      scope: global
+```
+
+Listing is unchanged: such a caller still sees the tools its tool-access
+policy allows, and is refused when it calls one.
+
+With auth off (the default, and `--unsafe-no-auth`) nothing changes.
+
+Over stdio with `auth.enabled: true`, both invoke paths now decide
+`tool:invoke` for the principal `auth.stdio.principal` declares, on the roles
+it declares. The default declaration is `roles: [viewer]`, which does not hold
+`tool:invoke`, so its flat calls are now refused where they used to be served.
+Declare `developer` or `service-account` where a stdio session must call tools:
+
+```yaml
+auth:
+  stdio:
+    principal:
+      id: local-user
+      tenant_id: local
+      roles: [developer]
+```
+
+The same declaration also makes `hangar_call` over stdio with auth on serve a
+caller it used to refuse as unauthenticated. The declared roles are the
+principal's only role source: the configured role store and any OPA policy are
+not consulted for it.
+
+### `set_governance_attributes` is removed
+
+The 2.22.0 upgrade note said `set_governance_attributes` in
+`mcp_hangar.observability.conventions` was kept for an ADR-007 adapter. It is
+now removed: it wrote `mcp.caller.roles` onto a span, which the telemetry data
+contract never allows, and the caller's own ids without the
+`observability.tracing.caller_ids` opt-in. Nothing in Hangar called it.
+
+An adapter that called it sets the attributes it needs itself, with the
+constants that stay in `mcp_hangar.observability.conventions`:
+
+```python
+# before
+from mcp_hangar.observability.conventions import set_governance_attributes
+set_governance_attributes(span, mcp_server_id="math", tool_name="add", caller_type="human")
+
+# after
+from mcp_hangar.observability.conventions import Caller, GenAI, McpServer
+span.set_attribute(McpServer.ID, "math")
+span.set_attribute(GenAI.TOOL_NAME, "add")
+span.set_attribute(Caller.TYPE, "human")
+```
+
+Leave caller roles off: they belong on the audit record. Caller ids go on a span
+only when the operator turned `observability.tracing.caller_ids` on.
+
 ## Upgrade to 2.23.0
 
 ### a stdio front door advertises tools.listChanged

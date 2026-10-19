@@ -23,14 +23,17 @@ Example:
 import uuid
 from typing import Any
 
-from mcp_hangar._sdk_compat import Context, FastMCP
+from mcp_hangar._sdk_compat import Context, FastMCP, make_mcp_error
 
 from ....application.services.interceptor_registry import build_validator_pipeline
-from ....context import get_identity_context, identity_context_var
+from ....context import get_identity_context, identity_context_var, param_headers_unchecked
+from ....domain.contracts.authorization import AuthorizationResult
+from ....domain.exceptions import AccessDeniedError
 from ....domain.value_objects.identity import IdentityContext
 from ....logging_config import get_logger
 from ....metrics import BATCH_CALLS_TOTAL, BATCH_VALIDATION_FAILURES_TOTAL
 from ....observability.tracing import get_tracer
+from ....tasks_wire import HEADER_MISMATCH
 from ...context import get_context
 from ...session_guard import refuse_if_session_suspended
 from .concurrency import (
@@ -41,14 +44,13 @@ from .concurrency import (
     init_concurrency_manager,
     reset_concurrency_manager,
 )
-from .executor import BatchExecutor, format_result_dict
+from .executor import BatchExecutor, format_result_dict, publish_call_refused
 from .models import (
     DEFAULT_MAX_CONCURRENCY,
     DEFAULT_MAX_RETRIES,
     DEFAULT_TIMEOUT,
     MAX_CALLS_PER_BATCH,
     MAX_CONCURRENCY_LIMIT,
-    MAX_RESPONSE_SIZE_BYTES,
     MAX_TIMEOUT,
     MAX_TOTAL_RESPONSE_SIZE_BYTES,
     BatchResult,
@@ -103,12 +105,51 @@ def configured_executor() -> BatchExecutor:
 
 
 def _request_principal(ctx: Context | None) -> Any:
-    """The principal the auth middleware left on this request (``request.state.auth``), or None."""
+    """The principal the auth middleware left on this request (``request.state.auth``), or None.
+
+    *ctx* is FastMCP's ``Context`` on ``hangar_call``, or the lowlevel request
+    context the front door's flat ``tools/call`` receives, which carries the
+    request itself (#1622).
+
+    With no request at all -- stdio -- the caller is the principal the
+    configuration declares, or None (ADR-026). A request never borrows it: one
+    that carries no principal is still None.
+    """
     try:
-        _auth_state = getattr(getattr(getattr(ctx, "request_context", None), "request", None), "state", None)
-        return getattr(getattr(_auth_state, "auth", None), "principal", None)
+        inner = getattr(ctx, "request_context", None) or ctx
+        request = getattr(inner, "request", None)
+        if request is None:
+            from ....auth.stdio_principal import get_stdio_principal
+
+            return get_stdio_principal()
+        return getattr(getattr(request.state, "auth", None), "principal", None)
     except Exception:  # noqa: BLE001 -- fault barrier: identity lookup must not crash the call path
         return None
+
+
+#: What a call's audit record names when an OPA policy admitted it and no role did (#1347).
+OPA_POLICY_ROLE = "opa_policy"
+
+#: The reasons an allow decision gives when an OPA policy admitted the call
+#: without a role: ``OPAAuthorizer`` on its own, and ``CombinedAuthorizer``
+#: when OPA overrode an RBAC denial.
+_OPA_ALLOW_REASONS = frozenset({"opa_policy", "opa_override"})
+
+
+def _role_that_authorized(decision: object) -> tuple[str, ...]:
+    """What admitted a call, read from the allow decision itself (#1347).
+
+    The role the decision matched, else ``opa_policy`` when an OPA policy
+    admitted it, else nothing. The role store is not asked again and no value
+    is made up: a decision that names neither leaves the record without roles.
+    """
+    if not isinstance(decision, AuthorizationResult) or not decision.allowed:
+        return ()
+    if decision.matched_role:
+        return (decision.matched_role,)
+    if decision.reason in _OPA_ALLOW_REASONS:
+        return (OPA_POLICY_ROLE,)
+    return ()
 
 
 def _authorize_calls(
@@ -116,6 +157,8 @@ def _authorize_calls(
     call_ids: list[str],
     principal: Any,
     batch_id: str,
+    identity: IdentityContext | None = None,
+    authorizing_roles: dict[int, tuple[str, ...]] | None = None,
 ) -> dict[int, CallResult]:
     """Enforce ``tool:invoke`` authorization for each call, fail-closed.
 
@@ -139,11 +182,22 @@ def _authorize_calls(
 
     Fully fault-barriered: a missing app context (stdio) leaves behavior
     unchanged (allow), because no authz middleware is resolvable.
+
+    Each denial publishes one ``ToolCallRefused`` for audit (#1582), as a gate
+    named ``authorization``, carrying *identity* as the caller. An authorizer
+    that raised something other than a denial is no refusal, as a gate that
+    errs is none, and publishes nothing.
+
+    *authorizing_roles*, when given, receives what admitted each allowed call,
+    by index, from its own decision (``_role_that_authorized``). A call with
+    nothing to record gets no entry, and with auth off none does.
     """
     # Resolve the authz middleware. A missing app context (stdio/local) or an
     # unconfigured middleware means auth is off -> allow (backward compatible).
+    app_context: Any = None
     try:
-        auth_components = getattr(get_context(), "auth_components", None)
+        app_context = get_context()
+        auth_components = getattr(app_context, "auth_components", None)
     except Exception:  # noqa: BLE001 -- no app context (stdio/local) -> auth off, allow
         auth_components = None
     authz = getattr(auth_components, "authz_middleware", None)
@@ -157,6 +211,12 @@ def _authorize_calls(
 
     denied: dict[int, CallResult] = {}
 
+    # A declared stdio principal is decided on its declared roles (ADR-026, #1622).
+    from ....auth.stdio_principal import get_stdio_authorizer, get_stdio_principal
+
+    if principal is not None and principal is get_stdio_principal():
+        authz = get_stdio_authorizer()
+
     # Missing/anonymous principal under configured auth -> deny the whole batch.
     if principal is None or principal.is_anonymous():
         logger.warning(
@@ -165,7 +225,8 @@ def _authorize_calls(
             reason="missing_credentials",
             call_count=len(calls),
         )
-        for i, _call in enumerate(calls):
+        for i, call in enumerate(calls):
+            _publish_authorization_refusal(app_context, call, call_ids[i], identity, "unauthenticated")
             denied[i] = CallResult(
                 index=i,
                 call_id=call_ids[i],
@@ -181,7 +242,7 @@ def _authorize_calls(
     for i, call in enumerate(calls):
         tool = call.get("tool", "")
         try:
-            authz.authorize(
+            decision = authz.authorize(
                 principal=principal,
                 action="invoke",
                 resource_type="tool",
@@ -194,6 +255,8 @@ def _authorize_calls(
                 tool=tool,
                 reason=type(exc).__name__,
             )
+            if isinstance(exc, AccessDeniedError):
+                _publish_authorization_refusal(app_context, call, call_ids[i], identity, "tool_invoke_denied")
             denied[i] = CallResult(
                 index=i,
                 call_id=call_ids[i],
@@ -202,7 +265,36 @@ def _authorize_calls(
                 error_type="AuthorizationDenied",
                 elapsed_ms=0.0,
             )
+            continue
+        roles = _role_that_authorized(decision)
+        if roles and authorizing_roles is not None:
+            authorizing_roles[i] = roles
     return denied
+
+
+def _publish_authorization_refusal(
+    app_context: Any, call: dict[str, Any], call_id: str, identity: IdentityContext | None, reason: str
+) -> None:
+    """The ``ToolCallRefused`` of a call ``tool:invoke`` denied (#1582); its reason is a fixed code."""
+    spec = CallSpec(
+        index=0, call_id=call_id, mcp_server=call.get("mcp_server", ""), tool=call.get("tool", ""), arguments={}
+    )
+    event_bus = getattr(app_context, "event_bus", None)
+    publish_call_refused(event_bus, spec, 0.0, identity, gate="authorization", reason=reason)
+
+
+def _refuse_if_param_headers_unchecked(ctx: Context | None) -> None:
+    """Under ``headers.param_validation.required``, refuse ``Mcp-Param-*`` headers nothing checked (#1599).
+
+    ``hangar_call`` declares no ``x-mcp-header``, so no such header it carries is
+    ever checked against the body, and none reaches a selector.
+    """
+    from ....fastmcp_server.flat_tool_projection import param_validation_required
+
+    if param_validation_required() and param_headers_unchecked(ctx):
+        raise make_mcp_error(
+            HEADER_MISMATCH, "hangar_call: the request's Mcp-Param-* headers could not be validated against its body"
+        )
 
 
 def hangar_call(
@@ -210,7 +302,7 @@ def hangar_call(
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     timeout: float = DEFAULT_TIMEOUT,
     fail_fast: bool = False,
-    max_attempts: int = 1,
+    max_attempts: int | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Invoke tools on MCP mcp_servers (single or batch).
@@ -235,9 +327,13 @@ def hangar_call(
     Args:
         calls: list[{mcp_server, tool, arguments, timeout?}] - Invocations to execute
         max_concurrency: int - Parallel workers for this batch (default: 10, range: 1-50)
-        timeout: float - Batch timeout in seconds (default: 60, range: 1-300)
+        timeout: float - Batch timeout in seconds (default: 60, range: 1-300).
+            A call held for approval is not cut short by it: the call reads its
+            approval outcome, and the batch returns when the hold ends.
         fail_fast: bool - Stop batch on first error (default: false)
-        max_attempts: int - Total attempts per call including retries (default: 1, range: 1-10)
+        max_attempts: int | null - Total attempts per call including retries (range: 1-10). Omit it to use the
+            gateway's configured `retry:` policy (a single attempt when none is configured); 1 means exactly
+            one attempt, whatever is configured; a larger number can only lower the configured count.
 
     Returns:
         Success: {
@@ -317,6 +413,7 @@ def hangar_call(
     # (GHSA-fhwh-fmq2-7m5c). Raised rather than returned as a batch, so the
     # whole call is an error and no partial result can be read as served.
     refuse_if_session_suspended("hangar_call", ctx)
+    _refuse_if_param_headers_unchecked(ctx)
 
     # Bridge the authenticated caller identity into the tool-call path over
     # streamable-HTTP. FastMCP's streamable-HTTP transport runs tool calls in
@@ -412,7 +509,7 @@ def call_as(
         max_concurrency=1,
         timeout=timeout,
         fail_fast=False,
-        max_attempts=1,
+        max_attempts=None,
         whole_result=True,
     )
 
@@ -426,7 +523,7 @@ def _run_calls(
     max_concurrency: int,
     timeout: float,
     fail_fast: bool,
-    max_attempts: int,
+    max_attempts: int | None,
     whole_result: bool = False,
 ) -> dict[str, Any]:
     """Validate, authorize and execute *calls* for one caller: the body of ``hangar_call``.
@@ -446,7 +543,8 @@ def _run_calls(
     batch_id = str(uuid.uuid4())
 
     # Clamp max_attempts to valid range
-    max_attempts = max(1, min(max_attempts, 10))
+    if max_attempts is not None:
+        max_attempts = max(1, min(max_attempts, 10))
 
     tracer = get_tracer(__name__)
     with tracer.start_as_current_span("hangar_call") as root_span:
@@ -455,7 +553,8 @@ def _run_calls(
         root_span.set_attribute("batch.max_concurrency", max_concurrency)
         root_span.set_attribute("batch.timeout", timeout)
         root_span.set_attribute("batch.fail_fast", fail_fast)
-        root_span.set_attribute("batch.max_attempts", max_attempts)
+        if max_attempts is not None:
+            root_span.set_attribute("batch.max_attempts", max_attempts)
 
         logger.info(
             "hangar_call_requested",
@@ -513,8 +612,17 @@ def _run_calls(
         # Authorization gate (fail-closed): enforce tool:invoke per call BEFORE
         # execution, mirroring the REST guard. Denied calls never reach the
         # executor; authorized calls proceed. No-auth/stdio -> allow all.
+        # What admitted each allowed call, for its audit record (#1347).
+        roles_by_index: dict[int, tuple[str, ...]] = {}
         with tracer.start_as_current_span("hangar_call.authorize") as authz_span:
-            denied_by_index = _authorize_calls(calls, call_ids, principal, batch_id)
+            denied_by_index = _authorize_calls(
+                calls,
+                call_ids,
+                principal,
+                batch_id,
+                identity=identity or get_identity_context(),
+                authorizing_roles=roles_by_index,
+            )
             authz_span.set_attribute("authz.denied_count", len(denied_by_index))
 
         # Build call specs for the AUTHORIZED calls only. Give the executor a
@@ -535,6 +643,7 @@ def _run_calls(
                     timeout=call.get("timeout"),
                     max_retries=max_attempts,  # Internal field uses max_retries
                     whole_result=whole_result,
+                    caller_roles=roles_by_index.get(i, ()),
                 )
             )
             exec_to_orig.append(i)
@@ -643,7 +752,6 @@ __all__ = [
     "DEFAULT_TIMEOUT",
     "MAX_CALLS_PER_BATCH",
     "MAX_CONCURRENCY_LIMIT",
-    "MAX_RESPONSE_SIZE_BYTES",
     "MAX_TIMEOUT",
     "MAX_TOTAL_RESPONSE_SIZE_BYTES",
     # Concurrency

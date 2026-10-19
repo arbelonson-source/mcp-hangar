@@ -1,5 +1,7 @@
 """Config file manager - handles MCP Hangar config file operations."""
 
+import json
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -8,6 +10,34 @@ import yaml
 
 from .dependency_detector import DependencyStatus, detect_dependencies
 from .mcp_server_registry import McpServerDefinition
+
+
+def default_event_store_path() -> Path:
+    """Where the generated config keeps the event store: the user's state directory (#1772).
+
+    ``$XDG_STATE_HOME/mcp-hangar/events.db``, else ``~/.local/state/mcp-hangar/``.
+    The event store used to default to ``data/events.db`` relative to the
+    working directory, so a client that spawned Hangar from ``/`` or a read-only
+    directory had it refuse to start, with the client reporting only that the
+    connection closed.
+    """
+    state_home = os.environ.get("XDG_STATE_HOME")
+    base = Path(state_home) if state_home and Path(state_home).is_absolute() else Path.home() / ".local" / "state"
+    return base / "mcp-hangar" / "events.db"
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write *text* to *path*; a file this creates is readable by its owner only (#1653).
+
+    A configuration can name commands, paths and the environment variables a
+    server reads, and it was created 0644 under the user's umask. An existing file
+    keeps the mode its owner gave it: tightening a file the user chose to share
+    would be a surprise of its own.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w") as handle:
+        handle.write(text)
 
 
 class ConfigFileManager:
@@ -42,9 +72,7 @@ class ConfigFileManager:
         Args:
             config: Configuration dictionary to save.
         """
-        self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.config_path, "w") as f:
-            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        write_private(self.config_path, yaml.dump(config, default_flow_style=False, sort_keys=False))
 
     def backup(self) -> Path | None:
         """Create a timestamped backup of the config file.
@@ -220,7 +248,10 @@ class ConfigFileManager:
         if use_env:
             entry["env"] = {use_env: f"${{{use_env}}}"}
         elif config_value and mcp_server.env_var and mcp_server.config_type == "secret":
-            entry["env"] = {mcp_server.env_var: config_value}
+            # A reference, never the value: the file is committed, copied and backed up,
+            # and a prompted secret written into it sat there in plaintext (#1653). The
+            # caller tells the user where to set it.
+            entry["env"] = {mcp_server.env_var: f"${{{mcp_server.env_var}}}"}
 
         return entry
 
@@ -260,7 +291,9 @@ class ConfigFileManager:
             "#",
             "# Documentation: https://mcp-hangar.io/docs/reference/configuration",
             "",
-            "mcp_servers:",
+            # An empty mapping when nothing was selected: a bare `mcp_servers:` is
+            # a null, which the loader does not take for "none".
+            "mcp_servers:" if mcp_servers else "mcp_servers: {}",
         ]
 
         for mcp_server in mcp_servers:
@@ -321,6 +354,12 @@ class ConfigFileManager:
                 "      tenant_id: local",
                 "      roles: [viewer]",
                 "",
+                "# Where the audit trail is kept. Absolute, because the client starts",
+                "# Hangar in whatever directory it likes, possibly one nobody can write.",
+                "event_store:",
+                "  driver: sqlite",
+                f"  path: {json.dumps(str(default_event_store_path()))}",
+                "",
                 "# Logging",
                 "logging:",
                 "  level: INFO",
@@ -347,6 +386,4 @@ class ConfigFileManager:
                 `tool_projection`.
         """
         content = self.generate_initial_config(mcp_servers, configs, deps, pins=pins)
-        self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.config_path, "w") as f:
-            f.write(content)
+        write_private(self.config_path, content)

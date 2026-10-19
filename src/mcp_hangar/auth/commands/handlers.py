@@ -82,6 +82,7 @@ class CreateApiKeyHandler(CommandHandler):
             "raw_key": raw_key,
             "principal_id": command.principal_id,
             "name": command.name,
+            "created_by": command.created_by,
             "expires_at": command.expires_at.isoformat() if command.expires_at else None,
             "warning": "Save this key now - it cannot be retrieved later!",
         }
@@ -442,6 +443,7 @@ class SetToolAccessPolicyHandler(CommandHandler):
                 target_id=command.target_id,
                 allow_list=command.allow_list,
                 deny_list=command.deny_list,
+                set_by=command.set_by,
             )
         )
 
@@ -477,7 +479,9 @@ class ClearToolAccessPolicyHandler(CommandHandler):
         )
 
         self._tap_store.clear_policy(scope=command.scope, target_id=command.target_id)
-        self._event_bus.publish(ToolAccessPolicyCleared(scope=command.scope, target_id=command.target_id))
+        self._event_bus.publish(
+            ToolAccessPolicyCleared(scope=command.scope, target_id=command.target_id, cleared_by=command.cleared_by)
+        )
 
         return {
             "scope": command.scope,

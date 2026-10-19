@@ -25,6 +25,7 @@ from mcp_hangar.application.services.package_resolver import PackageResolver
 from mcp_hangar.application.services.secrets_resolver import SecretsResolver
 from mcp_hangar.domain.contracts.registry import PackageInfo, ServerDetails, TransportInfo
 from mcp_hangar.domain.exceptions import InstallationError
+from mcp_hangar.domain.security.hot_load_trust import HotLoadTrust
 from mcp_hangar.domain.value_objects import McpServerMode
 from mcp_hangar.infrastructure.installers import npx_installer, runtime_availability, uvx_installer
 
@@ -136,7 +137,7 @@ class TestAvailabilityComesFromTheInstallers:
 class _FakeRegistry:
     server: ServerDetails
 
-    async def get_server(self, server_id: str) -> ServerDetails | None:
+    async def get_server(self, server_id: str, *, fresh: bool = False) -> ServerDetails | None:
         return self.server if server_id in (self.server.id, self.server.name) else None
 
     async def search(self, query: str, limit: int = 10) -> list[Any]:
@@ -161,7 +162,7 @@ def _server_details(registry_type: str = "pypi") -> ServerDetails:
         description="Time tools",
         vendor="example",
         source_url=None,
-        is_official=True,
+        is_published=True,
         packages=[_package(registry_type)],
         required_env_vars=[],
     )
@@ -198,6 +199,7 @@ def _handler(
         mcp_server_factory=factory,
         mcp_server_repository=repository,
         approval_gate_available=approval_gate_available,
+        trust=lambda: HotLoadTrust(trusted_namespaces=("io.github.example/",)),
     )
     return handler, started, store
 
@@ -410,3 +412,50 @@ class TestGatingWithoutAGateIsRefused:
 
 def _raises() -> bool:
     raise RuntimeError("context not built")
+
+
+class TestALoadWithAListThatIsNotAListIsRefused:
+    """`deny_tools="add"` used to be split into `a`, `d`, `d` (#1718). Worse, the
+    policy was parsed only after the server was installed, started and put in
+    the runtime store, so a policy that failed to parse left the server loaded
+    with no policy at all. It is now parsed before anything happens.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _leave_the_global_resolver_as_we_found_it(self):
+        from mcp_hangar.domain.services import reset_tool_access_resolver
+
+        reset_tool_access_resolver()
+        yield
+        reset_tool_access_resolver()
+
+    @pytest.mark.parametrize("kwarg", ["allow_tools", "deny_tools", "approval_tools"])
+    @pytest.mark.parametrize("value", ["add", "", {"add": None}], ids=["str", "empty-str", "mapping"])
+    async def test_nothing_is_installed_started_or_registered(self, monkeypatch, kwarg, value):
+        from mcp_hangar.domain.services import get_tool_access_resolver
+
+        handler, started, store = _handler(monkeypatch, approval_gate_available=lambda: True)
+
+        with pytest.raises(ValueError, match="expected a list of patterns"):
+            await handler.handle(LoadMcpServerCommand(name="mcp-server-time", user_id=None, **{kwarg: value}))
+
+        assert started == []
+        assert store.added == []
+        assert get_tool_access_resolver().iter_registered_policies() == []
+
+    @pytest.mark.parametrize("kwarg", ["allow_tools", "deny_tools", "approval_tools"])
+    @pytest.mark.parametrize("value", [[""], ["   "]], ids=["empty", "whitespace"])
+    async def test_a_bad_pattern_no_longer_leaves_the_server_loaded_without_a_policy(self, monkeypatch, kwarg, value):
+        """A list is what the `hangar_load` signature lets through, so this is the
+        case that reached the handler: it raised only after `runtime_store.add`,
+        and the server stayed loaded with no policy."""
+        from mcp_hangar.domain.services import get_tool_access_resolver
+
+        handler, started, store = _handler(monkeypatch, approval_gate_available=lambda: True)
+
+        with pytest.raises(ValueError, match="pattern"):
+            await handler.handle(LoadMcpServerCommand(name="mcp-server-time", user_id=None, **{kwarg: value}))
+
+        assert started == []
+        assert store.added == []
+        assert get_tool_access_resolver().iter_registered_policies() == []

@@ -25,6 +25,7 @@ from mcp_hangar.domain.events import (
     McpServerQuarantined,
 )
 from mcp_hangar.logging_config import get_logger
+from mcp_hangar.observability.conventions import Discovery
 from mcp_hangar.observability.tracing import get_tracer, record_handled_failure
 
 if TYPE_CHECKING:
@@ -257,6 +258,39 @@ class DiscoveryOrchestrator:
         """
         return self._discovery_service.unregister_source(source_type)
 
+    def add_source_live(self, source: DiscoverySource) -> None:
+        """Add a source to a running orchestrator and start it, from a synchronous caller (#1674).
+
+        A source added after `start()` is not started by it. When discovery runs
+        on its own loop, the add and the start are scheduled onto that loop, so
+        the source map is changed where the cycle reads it and not from the
+        command bus's worker thread; before `start()` it is a plain add.
+        """
+        loop = self._loop
+        if loop is not None and loop.is_running():
+
+            async def _add_and_start() -> None:
+                self.add_source(source)
+                await source.start()
+
+            asyncio.run_coroutine_threadsafe(_add_and_start(), loop).result(timeout=30)
+            return
+        self.add_source(source)
+
+    def remove_source_live(self, source_type: str) -> DiscoverySource | None:
+        """Remove a source from a running orchestrator and stop it, from a synchronous caller (#1674)."""
+        loop = self._loop
+        if loop is not None and loop.is_running():
+
+            async def _remove_and_stop() -> DiscoverySource | None:
+                removed = self.remove_source(source_type)
+                if removed is not None:
+                    await removed.stop()
+                return removed
+
+            return asyncio.run_coroutine_threadsafe(_remove_and_stop(), loop).result(timeout=30)
+        return self.remove_source(source_type)
+
     def set_static_mcp_servers(self, names: set[str]) -> None:
         """Set static mcp_server names (from config).
 
@@ -368,11 +402,13 @@ class DiscoveryOrchestrator:
         most often has to establish from absence.
         """
         if self._may_manage():
+            skipped = self._idle.run_length
             if self._idle.recovered():
                 logger.info(
                     "discovery_resumed_on_this_instance",
                     detail="this instance now holds the management lease and is running discovery again",
                 )
+                self._trace_lease_transition(Discovery.HOLDER, skipped)
             return True
         if self._idle.failed():
             logger.info(
@@ -385,7 +421,20 @@ class DiscoveryOrchestrator:
                     "is not converging"
                 ),
             )
+        if self._idle.run_length == 1:
+            self._trace_lease_transition(Discovery.FOLLOWER, None)
         return False
+
+    def _trace_lease_transition(self, role: str, skipped_cycles: int | None) -> None:
+        """One short span when this instance changes lease role (#1296).
+
+        Only on the change, never per skipped cycle, and never a
+        `discovery.cycle`: a follower's skip is not a failed cycle.
+        """
+        with get_tracer(__name__).start_as_current_span("discovery.lease_transition") as span:
+            span.set_attribute(Discovery.LEASE_ROLE, role)
+            if skipped_cycles is not None:
+                span.set_attribute(Discovery.SKIPPED_CYCLES, skipped_cycles)
 
     async def run_discovery_cycle(self) -> DiscoveryCycleResult:
         """Run a single discovery cycle.
@@ -716,7 +765,13 @@ class DiscoveryOrchestrator:
         }
 
     async def approve_mcp_server(self, name: str) -> dict[str, Any]:
-        """Approve a quarantined mcp_server.
+        """Approve a quarantined or pending mcp_server.
+
+        A server waits in one of two places: quarantine, where it failed
+        validation, and pending, where it passed but ``auto_register`` is off.
+        ``hangar_discovered`` lists the second kind, and approval only looked
+        in the first, so with ``auto_register: false`` nothing could ever
+        register a discovered server (#1667).
 
         Args:
             name: McpServer name
@@ -725,6 +780,10 @@ class DiscoveryOrchestrator:
             Result dictionary
         """
         mcp_server = self._lifecycle_manager.approve(name)
+        was_pending = False
+        if mcp_server is None:
+            mcp_server = self._discovery_service.approve_pending(name)
+            was_pending = mcp_server is not None
 
         if mcp_server:
             # Register with main registry
@@ -735,6 +794,9 @@ class DiscoveryOrchestrator:
                     logger.error(f"Error registering approved mcp_server {name}: {e}")
                     return {"approved": False, "mcp_server": name, "error": str(e)}
 
+            if was_pending:
+                # Tracked from here on, so a later cycle sees it unchanged and its TTL runs.
+                self._lifecycle_manager.add_mcp_server(mcp_server)
             self._validator.record_registration(mcp_server)
             main_metrics.record_discovery_registration(source_type=mcp_server.source_type)
 
@@ -743,11 +805,11 @@ class DiscoveryOrchestrator:
         return {
             "approved": False,
             "mcp_server": name,
-            "error": "McpServer not found in quarantine",
+            "error": "McpServer not found in quarantine or pending",
         }
 
     async def reject_mcp_server(self, name: str) -> dict[str, Any]:
-        """Reject a quarantined mcp_server.
+        """Reject a quarantined or pending mcp_server.
 
         Args:
             name: McpServer name
@@ -755,7 +817,7 @@ class DiscoveryOrchestrator:
         Returns:
             Result dictionary
         """
-        mcp_server = self._lifecycle_manager.reject(name)
+        mcp_server = self._lifecycle_manager.reject(name) or self._discovery_service.reject_pending(name)
 
         if mcp_server:
             return {"rejected": True, "mcp_server": name}
@@ -763,7 +825,7 @@ class DiscoveryOrchestrator:
         return {
             "rejected": False,
             "mcp_server": name,
-            "error": "McpServer not found in quarantine",
+            "error": "McpServer not found in quarantine or pending",
         }
 
     async def get_sources_status(self) -> list[dict[str, Any]]:

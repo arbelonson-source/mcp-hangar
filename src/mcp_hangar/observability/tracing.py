@@ -13,6 +13,8 @@ Configuration via environment variables:
     MCP_SPAN_ATTRIBUTE_LENGTH_LIMIT: Longest attribute value on Hangar's own
         provider, in characters (default: 256). The OTEL_*_LENGTH_LIMIT
         variables win when set: see _span_limits().
+    MCP_TRACING_CALLER_IDS: Put caller user, agent and session ids on spans
+        (default: false). Read once by the bootstrap: see set_caller_ids_on_spans().
 
 OTLP trace exporter precedence, first match wins (resolve_otlp_exporter_settings):
     protocol: OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, OTEL_EXPORTER_OTLP_PROTOCOL,
@@ -54,7 +56,7 @@ from typing import Any, TypeVar
 from mcp_hangar.errors import ExpectedRefusal, bounded_error_type
 from mcp_hangar.logging_config import env_length_limit, get_logger
 from mcp_hangar.metrics import record_otlp_export_failure
-from mcp_hangar.observability.conventions import MCP, Gate, GenAI, Retry, Shaping
+from mcp_hangar.observability.conventions import MCP, EventDelivery, Gate, GenAI, Retry, Route, Saga, Shaping
 
 logger = get_logger(__name__)
 
@@ -182,6 +184,9 @@ class NoOpSpan:
     def add_event(self, name: str, attributes: dict | None = None) -> None:
         pass
 
+    def add_link(self, context: Any, attributes: dict | None = None) -> None:
+        pass
+
     def __enter__(self) -> "NoOpSpan":
         return self
 
@@ -283,6 +288,23 @@ def disable_tracing() -> None:
     """
     global _disabled
     _disabled = True
+
+
+# Set by the bootstrap from `observability.tracing.caller_ids` (#1580). Off: the
+# telemetry data contract (#1276) keeps caller user, agent and session ids off
+# spans unless the operator opts in. Audit records are another sink, unaffected.
+_caller_ids_on_spans = False
+
+
+def set_caller_ids_on_spans(enabled: bool) -> None:
+    """Let spans carry the caller's user, agent and session ids, or stop them."""
+    global _caller_ids_on_spans
+    _caller_ids_on_spans = enabled
+
+
+def caller_ids_on_spans() -> bool:
+    """Whether the operator opted in to caller user, agent and session ids on spans."""
+    return _caller_ids_on_spans
 
 
 def _build_sampler() -> Any:
@@ -924,40 +946,49 @@ def record_retry_attempt(layer: str, index: int, reason: str, backoff_s: float) 
         logger.debug("retry_event_failed", layer=layer, index=index)
 
 
+def record_event_handled(span: Any, handler: Any, kind: str, error: BaseException | None = None) -> None:
+    """Record one event handler's run as an event on its `event.publish.<Type>` span (#1280).
+
+    An event, not a span: delivery runs for every live, tailed and recovered
+    event, and a span per handler would multiply the trace by the handler count.
+    The handler is named by its bounded `__qualname__`, never by its repr or
+    arguments; a failure adds its bounded class name as `error.type`. The span's
+    ERROR status stays `record_handled_failure`'s job. Never raises.
+    """
+    try:
+        if not span.is_recording():
+            return
+        name = getattr(handler, "__qualname__", None) or type(handler).__qualname__
+        attributes = {
+            EventDelivery.HANDLER_NAME: bounded_error_type(name),
+            EventDelivery.HANDLER_KIND: kind,
+            EventDelivery.HANDLER_OUTCOME: EventDelivery.SUCCESS if error is None else EventDelivery.ERROR,
+        }
+        if error is not None:
+            attributes[ERROR_TYPE] = bounded_error_type(type(error).__qualname__)
+        span.add_event(EventDelivery.HANDLED_EVENT, attributes)
+    except Exception:  # noqa: BLE001 -- fault barrier: telemetry must not break delivery
+        logger.debug("event_handled_record_failed", kind=kind)
+
+
 def record_mutation(direction: str, changed: bool, duration_ms: float) -> None:
     """Record one mutator pipeline run on the ambient `batch.call.<tool>` span (#1298).
 
-    Observes a mutation already applied and never raises. Nothing about the
-    payload is recorded, only whether it changed and how long it took.
+    An event, at most two per call: `conventions.Shaping` says why it is not a
+    span or a histogram. Observes a mutation already applied and never raises.
+    Nothing about the payload is recorded, only whether it changed and how long
+    it took; a direction outside `Shaping.DIRECTIONS` records nothing.
     """
     try:
         span = _ambient_span()
-        if span is None:
+        if span is None or direction not in Shaping.DIRECTIONS:
             return
         span.add_event(
             Shaping.MUTATION_EVENT,
             {Shaping.DIRECTION: direction, Shaping.CHANGED: changed, Shaping.DURATION_MS: duration_ms},
         )
     except Exception:  # noqa: BLE001 -- fault barrier: telemetry must not break a call
-        logger.debug("mutation_event_failed", direction=direction)
-
-
-def record_result_drop(reason: str, size_bytes: int, limit_bytes: int) -> None:
-    """Record a result the per-call size limit dropped, on the ambient call span (#1298). Never raises."""
-    try:
-        span = _ambient_span()
-        if span is None:
-            return
-        span.add_event(
-            Shaping.DROP_EVENT,
-            {
-                Shaping.REASON: bounded_error_type(reason),
-                Shaping.SIZE_BYTES: size_bytes,
-                Shaping.LIMIT_BYTES: limit_bytes,
-            },
-        )
-    except Exception:  # noqa: BLE001 -- fault barrier: telemetry must not break a call
-        logger.debug("drop_event_failed", reason=reason)
+        logger.debug("mutation_event_failed")
 
 
 def _ambient_span() -> Any:
@@ -997,6 +1028,24 @@ def record_gate_decision(
         logger.debug("gate_event_failed", gate=name)
 
 
+def record_route(backend: str | None, reason: str) -> None:
+    """Set which backend the call went to, and why, on the ambient `batch.call.<tool>` span (#1286).
+
+    Observes a selection already made and never raises: a telemetry failure
+    must not change where the call goes. `backend` is omitted when None, as
+    when no member was available.
+    """
+    try:
+        span = _ambient_span()
+        if span is None:
+            return
+        span.set_attribute(Route.REASON, reason)
+        if backend is not None:
+            span.set_attribute(Route.BACKEND, backend)
+    except Exception:  # noqa: BLE001 -- fault barrier: telemetry must not break routing
+        logger.debug("route_attributes_failed")
+
+
 def record_call_outcome(outcome: str) -> None:
     """Set `hangar.call.outcome` on the ambient `batch.call.<tool>` span. Never raises."""
     try:
@@ -1030,6 +1079,105 @@ def _recorded_call_outcome(span: Any) -> str | None:
         return (getattr(span, "attributes", None) or {}).get(Gate.CALL_OUTCOME)
     except Exception:  # noqa: BLE001 -- fault-barrier: tracing must not break the traced path
         return None
+
+
+def record_caught_failure(span: Any, error: BaseException) -> None:
+    """End a span a fault barrier caught ``error`` in: ERROR, unless it is an expected refusal.
+
+    A refusal keeps the `error.type` that names it and leaves the status UNSET
+    (ADR-029 s5), the rule `_TextFreeTracer` applies to an escaping exception.
+    """
+    if isinstance(error, ExpectedRefusal):
+        _set_error_type_if_absent(span, type(error).__qualname__)
+        return
+    record_handled_failure(span, error)
+
+
+def record_ambient_failure(error: BaseException) -> None:
+    """`record_caught_failure` on the ambient span, when there is a real one. Never raises."""
+    try:
+        span = _ambient_span()
+        if span is not None:
+            record_caught_failure(span, error)
+    except Exception:  # noqa: BLE001 -- fault barrier: telemetry must not break the caller
+        logger.debug("ambient_failure_record_failed")
+
+
+def record_saga_step(name: str, outcome: str) -> None:
+    """Record one saga step's outcome as an event on the ambient `saga.run` span (#1296). Never raises."""
+    try:
+        span = _ambient_span()
+        if span is not None:
+            span.add_event(Saga.STEP_EVENT, {Saga.STEP_NAME: bounded_error_type(name), Saga.STEP_OUTCOME: outcome})
+    except Exception:  # noqa: BLE001 -- fault barrier: telemetry must not break a saga
+        logger.debug("saga_step_event_failed", step=name)
+
+
+def current_traceparent() -> str | None:
+    """The ambient span as a W3C ``traceparent`` string, None when there is no real span.
+
+    The origin of scheduled work is kept as this string, as data and never as
+    an SDK object (ADR-029 s8). Never raises.
+    """
+    try:
+        if _ambient_span() is None:
+            return None
+        carrier: dict[str, Any] = {}
+        _get_propagator().inject(carrier)
+        origin = carrier.get("traceparent")
+        return origin if isinstance(origin, str) else None
+    except Exception:  # noqa: BLE001 -- fault barrier: telemetry must not break scheduling
+        return None
+
+
+def _origin_span_context(origin: str | None) -> Any:
+    """The span context a stored ``traceparent`` names, or None when it is absent or malformed."""
+    if not origin:
+        return None
+    from opentelemetry import trace as _trace
+
+    carried = _trace.get_current_span(_get_propagator().extract({"traceparent": origin})).get_span_context()
+    return carried if carried.is_valid else None
+
+
+def new_trace_linked_to(origin: str | None) -> dict[str, Any]:
+    """Keyword arguments that start a span in a new trace, linked to ``origin`` (ADR-029 s2, s8).
+
+    Scheduled work is not a child of what scheduled it: the cause is a timer,
+    so it is a link. An absent or malformed origin gives no link -- an unknown
+    cause is never invented -- and the span is still a new root, not a child of
+    whatever context the firing thread happens to hold.
+    """
+    try:
+        from opentelemetry import trace as _trace
+        from opentelemetry.context import Context
+
+        kwargs: dict[str, Any] = {"context": Context()}
+        carried = _origin_span_context(origin)
+        if carried is not None:
+            kwargs["links"] = [_trace.Link(carried)]
+        return kwargs
+    except Exception:  # noqa: BLE001 -- fault barrier: a bad origin must not stop the command
+        return {}
+
+
+def link_span_to_origin(span: Any, origin: str | None) -> bool:
+    """Add one link from an open ``span`` to ``origin``; True when a link was added (#1281).
+
+    For a span that has to be open before it is known whether the origin may
+    be named: a task follow-up links only once the caller is shown to own the
+    task. An absent or malformed origin adds nothing. A link added after start
+    is not seen by a link-aware head sampler; the parent-based default needs
+    none. Never raises.
+    """
+    try:
+        carried = _origin_span_context(origin)
+        if carried is None:
+            return False
+        span.add_link(carried)
+        return True
+    except Exception:  # noqa: BLE001 -- fault barrier: telemetry must not break a follow-up
+        return False
 
 
 def inject_trace_context(carrier: dict[str, Any]) -> None:

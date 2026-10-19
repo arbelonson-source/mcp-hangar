@@ -22,7 +22,7 @@ from mcp_hangar._sdk_compat import Tool as MCPTool
 from mcp_hangar.fastmcp_server import catalogue_warmup
 
 
-def _as_tools(flat):
+def _as_tools(flat, tenant_id=None):
     """Real Tool objects: ListToolsResult validates what it is handed."""
     return [MCPTool(name=n, description=n, inputSchema={"type": "object"}) for n in flat]
 
@@ -121,7 +121,6 @@ class TestTheListingRebuildsAfterWaiting:
         monkeypatch.setattr(ftp, "_classify_empty_projection", lambda tenant_id: reason)
         monkeypatch.setattr(ftp, "_memoise_flat_map", lambda *a, **k: None)
         monkeypatch.setattr(ftp, "_envelope", lambda ctx: {"method": "tools/list"})
-        monkeypatch.setattr(ftp, "build_projected_list_cache_meta", lambda tenant: None)
         monkeypatch.setattr(
             ftp,
             "get_identity_context",
@@ -155,7 +154,6 @@ class TestTheListingRebuildsAfterWaiting:
         monkeypatch.setattr(ftp, "_classify_empty_projection", lambda tenant_id: "nothing_discovered")
         monkeypatch.setattr(ftp, "_memoise_flat_map", lambda *a, **k: None)
         monkeypatch.setattr(ftp, "_envelope", lambda ctx: {"method": "tools/list"})
-        monkeypatch.setattr(ftp, "build_projected_list_cache_meta", lambda tenant: None)
         monkeypatch.setattr(
             ftp,
             "get_identity_context",

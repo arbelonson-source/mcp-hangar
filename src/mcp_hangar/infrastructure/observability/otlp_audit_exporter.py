@@ -9,12 +9,13 @@ MIT licensed -- part of core observability infrastructure.
 
 import threading
 import time
+from collections.abc import Mapping
 from typing import Any
 
 from ...domain.events import current_instance_id
 from ...logging_config import env_length_limit, get_logger, truncate_text
 from ...metrics import record_otlp_audit_export_failure
-from ...observability.conventions import MCP, Caller, Cost, GenAI, McpServer
+from ...observability.conventions import MCP, Caller, Cost, GenAI, McpServer, Route
 from ...observability.tracing import OtlpExporterSettings, _build_resource, resolve_otlp_exporter_settings
 
 logger = get_logger(__name__)
@@ -338,13 +339,16 @@ class OTLPAuditExporter:
         cost_input_tokens: int | None = None,
         cost_output_tokens: int | None = None,
         tenant_id: str | None = None,
+        refusal: Mapping[str, str] | None = None,
+        route_backend: str | None = None,
     ) -> None:
         """Export a tool invocation event as an audit log record.
 
         Args:
-            mcp_server_id: McpServer that handled the tool call.
+            mcp_server_id: The logical target the caller named: the group, for
+                a group call (#1594).
             tool_name: Tool that was invoked.
-            status: Outcome -- "success", "error", "timeout", "blocked".
+            status: Outcome -- "success", "error", or "denied" for a refused call.
             duration_ms: Call duration in milliseconds.
             user_id: Optional calling user identity.
             session_id: Optional MCP session identifier.
@@ -357,6 +361,11 @@ class OTLPAuditExporter:
             cost_input_tokens: Optional input tokens consumed.
             cost_output_tokens: Optional output tokens produced.
             tenant_id: Optional tenant of the caller.
+            refusal: A refused call's bounded ``hangar.gate.*`` or
+                ``hangar.l7.*`` attributes (#1582), set as given.
+            route_backend: The server the call was routed to, the member for a
+                group call, as ``hangar.route.backend`` (#1594). Left out when
+                None: a refusal before a backend was chosen.
         """
         try:
             attributes: dict = {
@@ -388,6 +397,9 @@ class OTLPAuditExporter:
                 attributes[GenAI.USAGE_INPUT_TOKENS] = cost_input_tokens
             if cost_output_tokens is not None:
                 attributes[GenAI.USAGE_OUTPUT_TOKENS] = cost_output_tokens
+            if route_backend is not None:
+                attributes[Route.BACKEND] = route_backend
+            attributes.update(refusal or {})
 
             self._emit_log_record(attributes)
 

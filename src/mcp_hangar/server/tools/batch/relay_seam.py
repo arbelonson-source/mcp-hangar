@@ -26,8 +26,11 @@ from typing import Any
 from ....application.tasks.tool_pin_context import reset_current_tool_pin, set_current_tool_pin
 from ....context import caller_polls_tasks_var, identity_context_var
 from ....domain.services.task_ownership import TaskOwner
+from ....errors import bounded_error_type
+from ....infrastructure.observability.task_relay_spans import record_follow_up, relay_error_type, unhanded_cancel_span
 from ....logging_config import get_logger
-from ....tasks_wire import EXTENSION_ID
+from ....observability.conventions import TaskRelay
+from ....tasks_wire import EXTENSION_ID, CancelTaskRequestParams
 from ...context import get_context
 from .models import CallResult, RelayCapture
 
@@ -101,13 +104,21 @@ def _cancel_unhanded_task(capture: RelayCapture) -> None:
     target_server_id = capture.target_server_id
     mcp_server = capture.logical_mcp_server
     tool = capture.tool
+    origin = capture.origin_traceparent
 
     def _cancel() -> None:
+        # No request to be a child of: a new trace linked to the refused call (#1281).
+        with unhanded_cancel_span(origin, mcp_server, tool):
+            _relay_cancel()
+
+    def _relay_cancel() -> None:
         try:
-            # The param shape the served `tasks/cancel` relays upstream, so an
-            # upstream sees one kind of cancel whoever asked for it.
-            response = router(target_server_id, "tasks/cancel", {"task_id": task_id}, _CANCEL_TIMEOUT)
+            # The params the served `tasks/cancel` relays upstream, `{"taskId": ...}`,
+            # so an upstream sees one kind of cancel whoever asked for it.
+            params = CancelTaskRequestParams(task_id=task_id).model_dump(by_alias=True)
+            response = router(target_server_id, "tasks/cancel", params, _CANCEL_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 -- fault barrier: a cancel must never surface anywhere
+            record_follow_up(TaskRelay.ERROR, error_type=type(exc).__qualname__, failed=True)
             logger.info(
                 "task_relay_cancel_unhanded_task",
                 outcome="failed",
@@ -118,6 +129,9 @@ def _cancel_unhanded_task(capture: RelayCapture) -> None:
             )
             return
         error = response.get("error") if isinstance(response, dict) else None
+        failure = relay_error_type(response)
+        outcome = TaskRelay.UNCONFIRMED if failure else TaskRelay.CONFIRMED
+        record_follow_up(outcome, error_type=failure, failed=failure is not None)
         logger.info(
             "task_relay_cancel_unhanded_task",
             outcome="refused" if error else "cancelled",
@@ -251,13 +265,16 @@ def govern_relayed_tasks(executed: list[CallResult]) -> None:
             except ValueError as exc:
                 # Fail-closed extraction: a malformed/idless upstream task handle.
                 # TODO(P3.4): increment a relay-registration-failure metric counter.
+                # A ValidationError's text echoes the upstream's handle, so WARNING
+                # gets the bounded type and DEBUG the text (#1276 R7, #1607).
                 logger.warning(
                     "task_relay_mint_failed",
                     call_id=r.call_id,
                     mcp_server=capture.logical_mcp_server,
                     tool=capture.tool,
-                    error=str(exc),
+                    error_type=bounded_error_type(type(exc).__name__),
                 )
+                logger.debug("task_relay_mint_failed_detail", call_id=r.call_id, error=str(exc))
                 executed[i] = CallResult(
                     index=r.index,
                     call_id=r.call_id,
@@ -296,6 +313,7 @@ def govern_relayed_tasks(executed: list[CallResult]) -> None:
                     correlation_id=capture.correlation_id,
                     mcp_server_id=capture.logical_mcp_server,
                     tool_name=capture.tool,
+                    origin_traceparent=capture.origin_traceparent,
                 )
             except Exception as exc:  # noqa: BLE001 -- any register/emit failure -> distinct fail-closed result
                 # relay_and_govern's atomic rollback leaves ZERO governed state.

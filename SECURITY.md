@@ -8,8 +8,10 @@ We take the security of MCP Hangar seriously. If you believe you have found a se
 
 ### How to Report
 
-1. **Email**: Send details to the project maintainers (contact information in the repository)
-2. **Private Disclosure**: Use [GitHub's private vulnerability reporting](https://github.com/mcp-hangar/mcp-hangar/security/advisories/new) if available
+Report it through GitHub's private vulnerability reporting:
+[open a draft security advisory](https://github.com/mcp-hangar/mcp-hangar/security/advisories/new).
+The report is visible only to you and the maintainers, and the fix is prepared
+in a private fork of the advisory before anything is published.
 
 ### What to Include
 
@@ -49,11 +51,15 @@ This project implements multiple security layers:
 
 ## Supported Versions
 
-| Version | Supported          |
+| Version | Supported |
 | ------- | ------------------ |
-| 1.0.x   | :white_check_mark: |
-| 0.12.x  | :white_check_mark: |
-| < 0.12  | :x:                |
+| 2.x (newest minor) | :white_check_mark: |
+| 1.6.x | :x: |
+| < 1.6 | :x: |
+
+Security fixes land on the 2.x line, in a new 2.x release; upgrade to the newest
+2.x minor to receive them. Older lines are closed and receive no backports. This
+is the same policy as the [security page of the documentation](https://github.com/mcp-hangar/docs/blob/main/security.md).
 
 ## Security Best Practices
 
