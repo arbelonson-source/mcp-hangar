@@ -68,6 +68,8 @@ class Upstream(BaseHTTPRequestHandler):
     properties: ClassVar[dict[str, Any]] = {"x": {"type": "string"}}
     #: A description for a tool named here; a tool not named here has none.
     descriptions: ClassVar[dict[str, str]] = {}
+    #: More fields of a tool named here (``title``, ``annotations``, ``_meta``, ...).
+    extras: ClassVar[dict[str, dict[str, Any]]] = {}
     called: ClassVar[list[str]] = []
     #: A tool named here is answered only once its event is set, so a test can
     #: keep a call in flight. The call is recorded in `called` when it arrives.
@@ -93,6 +95,7 @@ class Upstream(BaseHTTPRequestHandler):
                 "name": name,
                 **({"description": self.descriptions[name]} if name in self.descriptions else {}),
                 "inputSchema": {"type": "object", "properties": self.properties},
+                **self.extras.get(name, {}),
             }
             for name in self.tools
         ]
@@ -289,7 +292,9 @@ def front_door(
         resolver.set_standalone_member_policy(SERVER, tenant, ToolAccessPolicy(allow_list=allowed))
 
     handler: type[Upstream] = type(
-        "_ThisUpstream", (upstream_class,), {"tools": tools, "called": [], "holds": {}, "descriptions": {}}
+        "_ThisUpstream",
+        (upstream_class,),
+        {"tools": tools, "called": [], "holds": {}, "descriptions": {}, "extras": {}},
     )
     upstream = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()

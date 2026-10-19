@@ -88,17 +88,20 @@ def _listed(tools: list[Any], *, named: str, served_by: str | None = None, tenan
 
     A tool that drifted from a blocking pin is left out (#1776): the call is
     refused, and listing it would hand the model the drifted description.
-    ``hangar_details`` and REST show it to the operator, with the reason.
+    ``hangar_details`` and REST show it to the operator, with the reason. A
+    tool under a blocking pin is served with only the fields the pin covers.
     """
     registry = get_tool_projection_registry()
     # A server named directly is held to the pins of the groups that own it, as its call is.
     groups = () if served_by else _owning_groups(named)
+    scopes = dict.fromkeys((named, served_by or named, *groups))
     listed = []
     for tool in tools:
         entry = tool.to_dict()
         fields = registry.digest_fields(entry, named=named, served_by=served_by, tenant_id=tenant_id, groups=groups)
         if "withheld" in fields:
             continue
+        entry = registry.served_definition(entry, tenant_id, scopes)
         entry.update(fields)
         listed.append(entry)
     return listed
@@ -109,16 +112,19 @@ def _withhold_drifted(mcp_server: str, tools: list[dict], tenant_id: str | None)
 
     *tools* is the list already filtered by tool access, so a caller is told
     about no tool it could not list (#905). A withheld entry carries its name,
-    the reason and the digests, never the drifted description.
+    the reason and the digests, never the drifted description. Each tool left
+    in *tools* under a blocking pin is cut down to the fields the pin covers.
     """
     registry = get_tool_projection_registry()
     groups = _owning_groups(mcp_server)
-    withheld = []
-    for tool in list(tools):
+    withheld: list[dict] = []
+    for index, tool in reversed(list(enumerate(tools))):
         fields = registry.digest_fields(tool, named=mcp_server, tenant_id=tenant_id, groups=groups)
         if "withheld" in fields:
-            tools.remove(tool)
-            withheld.append({"name": tool.get("name", ""), "reason": fields.pop("withheld"), **fields})
+            del tools[index]
+            withheld.insert(0, {"name": tool.get("name", ""), "reason": fields.pop("withheld"), **fields})
+        else:
+            tools[index] = registry.served_definition(tool, tenant_id, (mcp_server, *groups))
     return withheld
 
 

@@ -111,6 +111,13 @@ it, with the reason:
 "withheld_tools": [{"name": "echo", "reason": "digest_drift", ...}]
 ```
 
+A pin covers the tool's `name`, `description`, `inputSchema` and
+`outputSchema`. A tool under a pin in `block` mode is served with those fields
+only: its `title`, `annotations`, `execution`, `icons` and `_meta` are not part
+of the digest, so they are not passed on, and a client falls back to the tool's
+name and the spec's cautious defaults (`readOnlyHint: false`,
+`destructiveHint: true`).
+
 `mcp-hangar pin --check` prints both digests and exits 1, so it belongs in CI or
 a pre-commit hook — there is one to copy at the end of
 [`.pre-commit-config.yaml`](.pre-commit-config.yaml), commented, with what it

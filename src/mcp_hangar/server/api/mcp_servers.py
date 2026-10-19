@@ -109,13 +109,21 @@ async def get_mcp_server(request: Request) -> HangarJSONResponse:
         null unless its state is dead, then why, since when and what starts it
         again (`DeadInfo` in `application.read_models`, #1418). A tool withheld
         for drift is shown as on the `/tools` route: name, digests and reason,
-        without its description (#1776).
+        without its description (#1776). Any other tool under a blocking pin
+        shows only the fields the pin covers.
     """
     _check_permission(request, resource_type="mcp_servers", action="read")
     mcp_server_id = request.path_params["mcp_server_id"]
     result = (await dispatch_query(GetMcpServerQuery(mcp_server_id=mcp_server_id))).to_dict()
+    registry = get_tool_projection_registry()
+    scopes = _pin_scopes(mcp_server_id)
+    # A withheld tool shows its name, digests and reason only; any other tool under a
+    # blocking pin shows only the fields the pin covers, as on every listing.
     result["tools"] = [
-        shown if "withheld" in (shown := tool_with_digest(tool, mcp_server_id)) else tool for tool in result["tools"]
+        shown
+        if "withheld" in (shown := tool_with_digest(tool, mcp_server_id))
+        else registry.served_definition(tool, None, scopes, any_tenant=True)
+        for tool in result["tools"]
     ]
     return HangarJSONResponse(result)
 
@@ -205,17 +213,23 @@ def tool_with_digest(tool: dict[str, Any], mcp_server_id: str) -> dict[str, Any]
     a group that owns it -- is withheld from every listing a model reads, and
     is shown here as its name, digests and ``withheld`` reason only (#1776).
     Every role that can read this route sees it, a service account included,
-    so the drifted description is not.
+    so the drifted description is not. A tool under a blocking pin for any
+    tenant is shown with only the fields the pin covers.
     """
-    from ..tools.batch.executor import owners_by_member
-
     registry = get_tool_projection_registry()
     fields = registry.digest_fields(tool, named=mcp_server_id)
     fields.pop("withheld", None)
-    scopes = (mcp_server_id, *owners_by_member().get(mcp_server_id, ()))
+    scopes = _pin_scopes(mcp_server_id)
     if registry.drifted_for_any_tenant(str(tool.get("name", "")), fields["digest"], scopes):
         return {"name": tool.get("name", ""), **fields, "withheld": WITHHELD_DIGEST_DRIFT}
-    return {**tool, **fields}
+    return {**registry.served_definition(tool, None, scopes, any_tenant=True), **fields}
+
+
+def _pin_scopes(mcp_server_id: str) -> tuple[str, ...]:
+    """The ids whose pins hold *mcp_server_id*'s tools: itself and the groups that own it."""
+    from ..tools.batch.executor import owners_by_member
+
+    return (mcp_server_id, *owners_by_member().get(mcp_server_id, ()))
 
 
 async def get_mcp_server_health(request: Request) -> HangarJSONResponse:

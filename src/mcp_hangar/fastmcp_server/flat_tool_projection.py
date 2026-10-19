@@ -509,7 +509,8 @@ def _build_mcp_tool_list(
         proj = registry.resolve(mcp_server, tool_name)
         if proj is None:
             continue  # Should not happen after _build_flat_map, but be safe.
-        if registry.drifted_pin(tool_name, proj.digest.sha256, tenant_id, _withdrawal_scopes(mcp_server)):
+        scopes = _withdrawal_scopes(mcp_server)
+        if registry.drifted_pin(tool_name, proj.digest.sha256, tenant_id, scopes):
             continue
 
         # Carry the WHOLE definition, renaming only what the flat surface owns.
@@ -518,8 +519,9 @@ def _build_mcp_tool_list(
         # front door had nothing to validate structured output against (#880).
         # `annotations.readOnlyHint` / `destructiveHint` are what a client uses to
         # decide whether a call needs a human in front of it; a projection that
-        # discards them makes every tool look alike.
-        payload = dict(proj.schema)
+        # discards them makes every tool look alike. A tool under a blocking pin
+        # is the exception: only what the pin covers is served.
+        payload = registry.served_definition(proj.schema, tenant_id, scopes)
         payload["name"] = flat_name
         payload.setdefault("description", "")
         payload.setdefault("inputSchema", {"type": "object", "properties": {}})
